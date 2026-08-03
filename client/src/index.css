@@ -1,0 +1,406 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===========================================================================
+   VEGA ANALYSIS — DESIGN SYSTEM
+   ---------------------------------------------------------------------------
+   Light, high-contrast trading terminal. Three rules govern everything here:
+
+   1. NO TEXT BELOW 4.5:1 CONTRAST. Every colour that carries a value, label or
+      heading is checked against the surface it sits on.
+   2. NO TEXT BELOW 11px. The old 9/10px labels were unreadable on a laptop and
+      invisible on a phone.
+   3. FIX IT ONCE. Where a problem is spread across dozens of components, it is
+      corrected at the token / utility level (see tailwind.config.js) rather
+      than by editing every file — that keeps this a visual change with no risk
+      to behaviour or layout logic.
+   =========================================================================== */
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;   /* stop iOS inflating text in landscape */
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-vega-black text-ink-700 antialiased;
+    font-family: 'Inter', 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'ss01';
+    font-synthesis-weight: none;
+    /* Nothing in this app is a horizontally-scrolling document. Wide content
+       (tables, charts) scrolls inside its OWN container instead — so a stray
+       wide child can never push the whole page sideways on a phone.
+       `clip`, not `hidden`: `hidden` turns <body> into a scroll container and
+       breaks every `position: sticky` header in the app (top bar, sidebar rail,
+       table headers). `clip` cuts the overflow without that side effect. */
+    overflow-x: clip;
+  }
+
+  /* Headings default to the darkest ink so a component that forgets a colour
+     class still renders readable rather than inheriting muted body copy. */
+  h1, h2, h3, h4, h5, h6 {
+    @apply text-ink-900;
+    font-weight: 650;
+    letter-spacing: -0.011em;
+  }
+
+  /* Native controls (date pickers, selects) follow the page, not the OS. */
+  :root {
+    color-scheme: light;
+    --vega-green: #0f7a46;
+    --vega-red: #c62828;
+    --vega-blue: #1d4ed8;
+  }
+
+  /* Visible, consistent keyboard focus everywhere — the app had none. */
+  :focus-visible {
+    outline: 2px solid theme('colors.vega-blue');
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+
+  ::selection {
+    background: rgba(29, 78, 216, 0.16);
+    color: #0b1220;
+  }
+}
+
+@layer components {
+  /* ---- Surfaces -------------------------------------------------------- */
+
+  .glass-card {
+    @apply rounded-xl border border-vega-border bg-vega-panel shadow-glass;
+  }
+
+  /* Card with a proper header/body split — used by the Vega workspace. */
+  .panel-head {
+    @apply flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-vega-border px-4 py-3;
+  }
+  .panel-title {
+    @apply text-sm font-semibold text-ink-900;
+  }
+  .panel-subtitle {
+    @apply text-2xs font-medium uppercase tracking-wider text-ink-500;
+  }
+
+  /* ---- Buttons --------------------------------------------------------- */
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg bg-vega-blue px-4 py-2
+           text-sm font-semibold text-white shadow-sm transition-colors
+           hover:bg-vega-blue-dark active:bg-vega-blue-dark
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-secondary {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg border border-vega-border
+           bg-vega-panel px-3.5 py-2 text-sm font-semibold text-ink-700 transition-colors
+           hover:border-vega-border-strong hover:bg-vega-panel-muted hover:text-ink-900
+           disabled:cursor-not-allowed disabled:opacity-45;
+  }
+  .btn-ghost {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg px-2.5 py-1.5
+           text-sm font-medium text-ink-600 transition-colors
+           hover:bg-vega-panel-muted hover:text-ink-900
+           disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent;
+  }
+  /* Every icon-only control needs a real hit target on touch. 44px is the
+     Apple/Material minimum; the app was shipping 28px taps. */
+  .btn-icon {
+    @apply inline-flex h-9 w-9 items-center justify-center rounded-lg text-ink-600
+           transition-colors hover:bg-vega-panel-muted hover:text-ink-900
+           disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:bg-transparent;
+  }
+  @media (pointer: coarse) {
+    .btn-icon { @apply h-11 w-11; }
+  }
+
+  /* ---- Forms ----------------------------------------------------------- */
+
+  /* Name kept for compatibility — every form in the app uses it. */
+  .input-dark {
+    @apply w-full rounded-lg border border-vega-border bg-vega-panel px-3 py-2 text-sm
+           font-medium text-ink-900 placeholder-ink-400 transition-shadow
+           focus:border-vega-blue focus:outline-none focus:ring-2 focus:ring-vega-blue/25;
+  }
+  .input-dark:hover:not(:focus) {
+    @apply border-vega-border-strong;
+  }
+
+  /* Date input: the browser default is a washed-out control that reads as
+     disabled next to real buttons. This gives it the same weight as the rest
+     of the toolbar and a full-width tap target for the calendar icon. */
+  .input-date {
+    @apply input-dark cursor-pointer font-mono tabular-nums;
+    min-height: 2.5rem;
+  }
+  .input-date::-webkit-calendar-picker-indicator {
+    cursor: pointer;
+    opacity: 0.65;
+    padding: 2px;
+    border-radius: 4px;
+    transition: opacity 0.15s ease, background-color 0.15s ease;
+  }
+  .input-date:hover::-webkit-calendar-picker-indicator {
+    opacity: 1;
+    background-color: rgba(29, 78, 216, 0.1);
+  }
+  /* Safari/iOS centres the value and leaves it grey; force the shared ink. */
+  .input-date::-webkit-date-and-time-value { text-align: left; color: #0b1220; }
+
+  /* ---- Data tables ----------------------------------------------------- */
+
+  /* The scroll container. Wide tables scroll HERE, never on <body>, and the
+     momentum flag keeps the swipe natural on iOS. */
+  .table-scroll {
+    @apply scroll-thin overflow-auto overscroll-contain;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .data-table {
+    @apply w-full border-collapse text-left;
+    /* Stops one long value from squeezing every other column to nothing. */
+    table-layout: auto;
+  }
+
+  /* Sticky header that actually stays put inside a scrolling container.
+     `position: sticky` on <thead> is unreliable across browsers, so it goes on
+     the cells — which is the combination that works in Safari too. */
+  .data-table thead th {
+    @apply sticky top-0 z-20 whitespace-nowrap bg-ink-800 px-3 py-2.5
+           text-2xs font-bold uppercase tracking-wider text-white;
+    box-shadow: theme('boxShadow.sticky-head');
+  }
+
+  .data-table tbody td {
+    @apply whitespace-nowrap border-b border-vega-border/70 px-3 py-2 text-xs text-ink-700;
+  }
+  .data-table tbody tr:nth-child(even) {
+    @apply bg-vega-panel-muted;
+  }
+  .data-table tbody tr:hover td {
+    @apply bg-vega-blue/[0.07];
+  }
+  .data-table tbody tr:last-child td {
+    @apply border-b-0;
+  }
+
+  /* ---- Value semantics ------------------------------------------------- */
+
+  .text-gain { @apply text-vega-green; }
+  .text-loss { @apply text-vega-red; }
+
+  /* Terminal numeral treatment: every live price, stat, and quantity in the
+     app renders in this class so the whole dashboard reads like a single
+     instrument panel rather than a generic admin template. */
+  .num {
+    @apply font-mono tabular-nums;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.012em;
+  }
+
+  /* Signed values in dense tables: colour alone is not enough at 12px, so
+     these also carry weight. */
+  .val-up   { @apply num font-semibold text-vega-green; }
+  .val-down { @apply num font-semibold text-vega-red; }
+  .val-flat { @apply num font-medium text-ink-600; }
+
+  .pill {
+    @apply inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border
+           px-2.5 py-1 text-2xs font-bold uppercase tracking-wide;
+  }
+
+  /* ---- Navigation ------------------------------------------------------ */
+
+  .nav-item {
+    @apply flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium
+           text-ink-600 transition-colors;
+  }
+  .nav-item:hover:not(:disabled) {
+    @apply bg-vega-blue/[0.07] text-ink-900;
+  }
+  .nav-item-active,
+  .nav-item-active:hover {
+    @apply bg-vega-blue/[0.10] font-semibold text-vega-blue;
+  }
+
+  .live-dot {
+    @apply relative inline-flex h-2 w-2 rounded-full bg-vega-green;
+  }
+  .live-dot::after {
+    content: '';
+    @apply absolute inset-0 rounded-full bg-vega-green animate-ping-slow;
+  }
+
+  /* ---- Scrollbars ------------------------------------------------------ */
+
+  .scroll-thin {
+    scrollbar-width: thin;
+    scrollbar-color: #b7c2d4 transparent;
+  }
+  .scroll-thin::-webkit-scrollbar { width: 9px; height: 9px; }
+  .scroll-thin::-webkit-scrollbar-thumb {
+    background-color: #c3cede;
+    border: 2px solid transparent;
+    background-clip: content-box;
+    border-radius: 999px;
+  }
+  .scroll-thin::-webkit-scrollbar-thumb:hover { background-color: #9aa8bf; }
+  .scroll-thin::-webkit-scrollbar-track { background: transparent; }
+
+  /* =========================================================================
+     PUBLIC WEBSITE (src/site/**)
+     -------------------------------------------------------------------------
+     The marketing site has a deliberately different visual language from the
+     terminal: gradients, 16px radii, Poppins display type, generous padding.
+
+     EVERY CLASS HERE IS PREFIXED `site-`. That is not cosmetic. The website's
+     original stylesheet defined its own `.btn-primary` and `.btn-ghost`, which
+     are the SAME names the app uses above for its compact terminal buttons.
+     Importing them unprefixed would silently restyle every button in the
+     dashboard, the admin console and the Vega workspace — whichever rule the
+     bundler happened to emit last would win.
+
+     Classes with no counterpart in the app (`site-card`, `site-eyebrow`, …)
+     are prefixed too, so the rule is "anything the website uses starts with
+     site-" with no exceptions to remember.
+     ========================================================================= */
+
+  .site-glass {
+    @apply border border-border/80 bg-white/80 backdrop-blur-xl;
+  }
+
+  .site-card {
+    @apply rounded-2xl border border-border bg-card shadow-card transition-shadow duration-300;
+  }
+  .site-card-hover {
+    @apply site-card hover:-translate-y-0.5 hover:shadow-card-hover;
+  }
+  .site-surface-soft {
+    @apply border border-border bg-slate-50;
+  }
+
+  .site-btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl bg-primary-gradient px-6 py-3
+           font-display font-semibold text-white shadow-glow transition-all duration-300
+           hover:-translate-y-0.5 hover:shadow-card-hover active:translate-y-0 active:scale-[0.98]
+           disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0;
+  }
+  .site-btn-outline {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl border border-border bg-white px-6 py-3
+           font-display font-semibold text-text transition-all duration-300
+           hover:border-primary/50 hover:text-primary hover:shadow-card;
+  }
+  .site-btn-ghost {
+    @apply inline-flex items-center justify-center gap-2 rounded-xl px-4 py-2.5
+           font-display font-semibold text-muted transition-colors duration-200
+           hover:bg-slate-100 hover:text-text;
+  }
+
+  .site-eyebrow {
+    @apply text-xs font-semibold uppercase tracking-[0.2em] text-primary;
+  }
+
+  .site-input {
+    @apply w-full rounded-xl border border-border bg-white px-4 py-3 text-sm text-text
+           transition-colors placeholder:text-text/30
+           focus:border-primary/50 focus:outline-none focus:ring-2 focus:ring-primary/15;
+  }
+}
+
+@layer utilities {
+  /*
+    ------------------------------------------------------------------------
+    LIGHT-THEME COMPATIBILITY SHIM.
+
+    The dark theme used translucent-WHITE fills (`bg-white/5`,
+    `bg-white/[0.03]`, `bg-white/10`) for card tints, chips and table row
+    hovers. On a white surface those are literally invisible, so ~30 hover
+    states and chips across 20 components silently stopped working.
+
+    Remapping the utilities here instead of editing all 20 files keeps this a
+    pure visual change with no risk of disturbing layout or behaviour — the
+    same reason the colour tokens are remapped in tailwind.config.js rather
+    than component-by-component.
+
+    `!important` is required because these override Tailwind's own generated
+    utilities of identical specificity.
+    ------------------------------------------------------------------------
+  */
+  .bg-white\/5 { background-color: rgb(15 23 42 / 0.04) !important; }
+  .hover\:bg-white\/5:hover { background-color: rgb(29 78 216 / 0.07) !important; }
+  .bg-white\/\[0\.03\] { background-color: rgb(15 23 42 / 0.03) !important; }
+  .hover\:bg-white\/\[0\.03\]:hover { background-color: rgb(29 78 216 / 0.06) !important; }
+  .bg-white\/10 { background-color: rgb(15 23 42 / 0.07) !important; }
+
+  /*
+    SLATE TEXT FLOOR.
+
+    `text-slate-400` (#94a3b8) measures 2.8:1 on white — well under the 4.5:1
+    floor — and it labels real content on the landing page, the pending-approval
+    screen and roughly a dozen spots in the admin console. Pulled up to the same
+    ink-500 the rest of the app uses for secondary copy.
+
+    Text-only on purpose: `bg-slate-50/100/200` are legitimate light surfaces in
+    those same files and must not move. Verified no `hover:`/`focus:` variants of
+    these two classes exist, so the base rule is sufficient.
+  */
+  .text-slate-300, .text-slate-400 { color: #5a6a85 !important; }
+
+  /*
+    MINIMUM LEGIBLE TYPE.
+
+    ~60 call sites use arbitrary `text-[9px]` / `text-[10px]`. Arbitrary values
+    bypass the theme's fontSize scale, so the floor has to be enforced here.
+    11px with a touch of tracking is the smallest size that stays readable for
+    uppercase micro-labels on a 1080p laptop and on a phone.
+  */
+  .text-\[9px\], .text-\[10px\] {
+    font-size: 0.6875rem !important;
+    line-height: 1rem;
+    letter-spacing: 0.015em;
+  }
+  .text-\[11px\] {
+    font-size: 0.6875rem !important;
+    line-height: 1rem;
+  }
+
+  /* Long identifiers (emails, symbols, JSON blobs) in narrow mobile cells. */
+  .break-anywhere {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  /* Fade the right edge of a horizontally scrollable region so it is visually
+     obvious there is more content off-screen. */
+  .scroll-hint-x {
+    mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent 100%);
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent 100%);
+  }
+
+  .animate-fade-in {
+    animation: vega-fade-in 0.25s ease-out;
+  }
+  .animate-ping-slow {
+    animation: vega-ping-slow 2.2s cubic-bezier(0, 0, 0.2, 1) infinite;
+  }
+}
+
+@keyframes vega-fade-in {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes vega-ping-slow {
+  0% { transform: scale(1); opacity: 0.7; }
+  70%, 100% { transform: scale(2.4); opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

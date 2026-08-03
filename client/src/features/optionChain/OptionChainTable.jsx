@@ -1,0 +1,334 @@
+import { memo, useEffect, useMemo, useRef } from 'react';
+
+/**
+ * Kite-style layout: calls on the left, strike in the centre, puts on the
+ * right. ITM side gets a subtle tint, ATM row gets the accent border.
+ *
+ * Columns shown (fixed, always visible):
+ *   CALL Delta | CALL Vega | Strike | PUT Vega | PUT Delta
+ *
+ * Uses only the existing design tokens (vega-*, glass-card, num, scroll-thin).
+ */
+
+const fmt = (v, dp = 2) =>
+  v == null || Number.isNaN(v) ? '–' : Number(v).toFixed(dp);
+
+const fmtInt = (v) =>
+  v == null ? '–' : Number(v).toLocaleString('en-IN');
+
+/**
+ * ---------------------------------------------------------------------------
+ * DELTA BAND FILTER  (display only — snapshot.chain is never touched)
+ * ---------------------------------------------------------------------------
+ * Exact-match keys, deliberately NOT symbol.includes('NIFTY').
+ *
+ *   "BANKNIFTY".includes("NIFTY")   === true
+ *   "FINNIFTY".includes("NIFTY")    === true
+ *   "MIDCPNIFTY".includes("NIFTY")  === true
+ *
+ * so a contains-check would hand all three the 0.05 band and the 0.20 rule
+ * would never run.
+ *
+ * Call and Put deltas are tested against their OWN signed range. Call delta
+ * is positive (0 to 1), put delta is negative (-1 to 0), straight from the
+ * feed — no Math.abs anywhere.
+ *
+ * ---------------------------------------------------------------------------
+ * FIXED HERE: NIFTY and SENSEX had min and max SWAPPED on the call side:
+ *
+ *     NIFTY:  { call: { max: 0.05, min: 0.60 }, ... }
+ *
+ * inRange() evaluates `d >= min && d <= max`, so that read as
+ * `d >= 0.60 && d <= 0.05` — impossible for any number. The call side was
+ * dead for both symbols and only the put side could ever keep a row.
+ * BANKNIFTY / FINNIFTY / MIDCPNIFTY were already correct.
+ * ---------------------------------------------------------------------------
+ */
+const DELTA_BANDS = {
+  NIFTY: { call: { min: 0.05, max: 0.60 }, put: { min: -0.60, max: -0.05 } },
+  SENSEX: { call: { min: 0.05, max: 0.60 }, put: { min: -0.60, max: -0.05 } },
+  BANKNIFTY: { call: { min: 0.20, max: 0.60 }, put: { min: -0.60, max: -0.20 } },
+  FINNIFTY: { call: { min: 0.20, max: 0.60 }, put: { min: -0.60, max: -0.20 } },
+  MIDCPNIFTY: { call: { min: 0.20, max: 0.60 }, put: { min: -0.60, max: -0.20 } },
+};
+
+// Equity F&O underlyings (RELIANCE, SBIN, TCS...) are not in the spec.
+// They fall back to the wider (NIFTY/SENSEX) band rather than showing nothing.
+const DEFAULT_BAND = { call: { min: 0.05, max: 0.60 }, put: { min: -0.60, max: -0.05 } };
+
+/**
+ * Which side decides whether a strike is shown.
+ *
+ *   'CALL' call delta must be in band          <- matches the Zerodha view
+ *   'PUT'  put delta must be in band
+ *   'OR'   either side
+ *   'AND'  both sides
+ *
+ * 'CALL' is the default because it reproduces the reference screenshot. On
+ * that board (call delta 0.90 down to 0.04) the three modes give:
+ *
+ *     CALL  12 rows   call delta 0.05 – 0.54
+ *     OR    18 rows   call delta 0.05 – 0.90
+ *     AND    3 rows   call delta 0.40 – 0.54
+ *
+ * 'OR' looks wrong on a chain because Δcall − Δput = 1 at every strike: the
+ * 0.90-delta call sits opposite a −0.10 put, which IS inside −0.60..−0.05,
+ * so 'OR' keeps the deep-ITM rows the band was meant to hide.
+ *
+ * Whichever mode is set, rows are kept or dropped WHOLE — a surviving row
+ * always carries the call and the put of the SAME strike, and order is never
+ * touched (we filter, we never sort or rebuild).
+ */
+const MATCH_MODE = 'CALL';
+
+function getDeltaBand(symbol) {
+  return DELTA_BANDS[String(symbol || '').toUpperCase()] || DEFAULT_BAND;
+}
+
+/**
+ * Straight signed range check, inclusive at both ends — "0.60 se chhoti,
+ * 0.05 se badi, aur unke barabar" means 0.05 and 0.60 themselves are IN.
+ *
+ * EPSILON: delta arrives as a solved float (derived from IV), so a strike
+ * that is conceptually exactly 0.05 or 0.60 can turn up as 0.049999998 or
+ * 0.600000004. A strict >= / <= would drop that boundary strike even though
+ * it belongs. 1e-6 is far tighter than delta ever moves tick to tick, so it
+ * only rescues true boundary cases and never widens the band in practice.
+ */
+const EPS = 1e-6;
+function inRange(delta, range) {
+  if (delta == null) return false;
+  const d = Number(delta);
+  return Number.isFinite(d) && d >= range.min - EPS && d <= range.max + EPS;
+}
+
+function rowPassesFilter(row, band) {
+  const callOk = inRange(row?.call?.delta, band.call);
+  const putOk = inRange(row?.put?.delta, band.put);
+  switch (MATCH_MODE) {
+    case 'PUT': return putOk;
+    case 'OR': return callOk || putOk;
+    case 'AND': return callOk && putOk;
+    default: return callOk;
+  }
+}
+
+/** Flashes a cell when its value changes, the way a real terminal does. */
+function useFlash(value) {
+  const ref = useRef(null);
+  const previous = useRef(value);
+
+  useEffect(() => {
+    if (previous.current === value || value == null || previous.current == null) {
+      previous.current = value;
+      return;
+    }
+    const up = value > previous.current;
+    previous.current = value;
+    const el = ref.current;
+    if (!el) return;
+
+    el.style.transition = 'none';
+    el.style.backgroundColor = up ? 'rgba(22,199,132,0.22)' : 'rgba(255,77,79,0.22)';
+    const id = setTimeout(() => {
+      el.style.transition = 'background-color 500ms ease-out';
+      el.style.backgroundColor = 'transparent';
+    }, 60);
+    return () => clearTimeout(id);
+  }, [value]);
+
+  return ref;
+}
+
+const ChainRow = memo(function ChainRow({ row, onSelect, rowRef }) {
+  const { call: c, put: p, strike, isAtm } = row;
+
+  const callItm = c.moneyness === 'ITM';
+  const putItm = p.moneyness === 'ITM';
+
+  const itmTint = 'bg-vega-amber/[0.06]';
+  const rowBase = 'border-b border-vega-border/50 hover:bg-white/[0.03] transition-colors';
+  const atmRing = isAtm ? 'ring-1 ring-inset ring-vega-cyan/60' : '';
+
+  return (
+    <tr ref={rowRef} className={`${rowBase} ${atmRing}`}>
+      {/* ---------- CALL ---------- */}
+      <td className={`num px-2 py-1.5 text-right text-gray-400 ${callItm ? itmTint : ''}`}>{fmt(c.delta, 3)}</td>
+      <td className={`num px-2 py-1.5 text-right text-gray-400 ${callItm ? itmTint : ''}`}>{fmt(c.vega)}</td>
+
+      {/* ---------- STRIKE ---------- */}
+      <td
+        onClick={() => onSelect?.(row)}
+        className={`num cursor-pointer border-x border-vega-border px-3 py-1.5 text-center font-semibold ${
+          isAtm ? 'bg-[#172d3a] text-vega-cyan' : 'bg-vega-panel-raised text-gray-200'
+        }`}
+      >
+        {fmtInt(strike)}
+      </td>
+
+      {/* ---------- PUT ---------- */}
+      <td className={`num px-2 py-1.5 text-right text-gray-400 ${putItm ? itmTint : ''}`}>{fmt(p.vega)}</td>
+      <td className={`num px-2 py-1.5 text-right text-gray-400 ${putItm ? itmTint : ''}`}>{fmt(p.delta, 3)}</td>
+    </tr>
+  );
+});
+
+const Th = ({ children, className = '' }) => (
+  <th className={`px-2 py-2 text-right text-[11px] font-medium uppercase tracking-wide text-gray-500 ${className}`}>
+    {children}
+  </th>
+);
+
+export default function OptionChainTable({ snapshot, onSelectStrike }) {
+  const atmRef = useRef(null);
+  const scrolledFor = useRef(null);
+
+  // Scroll ATM into view once per symbol/expiry, not on every tick.
+  useEffect(() => {
+    if (!snapshot) return;
+    const key = `${snapshot.symbol}-${snapshot.expiry}`;
+    if (scrolledFor.current === key) return;
+    scrolledFor.current = key;
+    atmRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }, [snapshot]);
+
+  /**
+   * Derived view only. .filter() returns a NEW array — snapshot.chain, the
+   * WebSocket payload and the backend response are all untouched, so live
+   * updates keep flowing exactly as before. Order is preserved: filter never
+   * reorders, it only drops non-matching rows.
+   */
+  const filteredRows = useMemo(() => {
+    if (!snapshot?.chain?.length) return [];
+    const band = getDeltaBand(snapshot.symbol);
+    return snapshot.chain.filter((row) => rowPassesFilter(row, band));
+  }, [snapshot]);
+
+  /**
+   * Column sums across the rows that survived the filter — the same totals
+   * the Vega Analysis chart plots through the session.
+   */
+  const totals = useMemo(() => {
+    const sum = (pick) => {
+      let acc = 0;
+      let seen = 0;
+      for (const row of filteredRows) {
+        const v = pick(row);
+        if (v == null || !Number.isFinite(Number(v))) continue;
+        acc += Number(v);
+        seen += 1;
+      }
+      return seen ? acc : null;
+    };
+    return {
+      callDelta: sum((r) => r.call?.delta),
+      callVega: sum((r) => r.call?.vega),
+      putVega: sum((r) => r.put?.vega),
+      putDelta: sum((r) => r.put?.delta),
+      count: filteredRows.length,
+    };
+  }, [filteredRows]);
+
+  if (!snapshot) return null;
+
+  // Fixed 5-column layout: CALL Delta, CALL Vega, Strike, PUT Vega, PUT Delta.
+  const CALL_COLUMNS = ['Delta', 'Vega'];
+  const PUT_COLUMNS = ['Vega', 'Delta'];
+
+  const callSpan = CALL_COLUMNS.length;
+  const putSpan = PUT_COLUMNS.length;
+
+  // Mirrored widths. table-fixed stops the browser sizing each column by
+  // content — without it the put side (whose deltas carry a minus sign) comes
+  // out fractionally wider and the strike drifts off centre.
+  const sideWidth = `${(96 / (callSpan + putSpan)).toFixed(3)}%`;
+
+  const band = getDeltaBand(snapshot.symbol);
+  const CALL_TOTALS = { Delta: totals.callDelta, Vega: totals.callVega };
+  const PUT_TOTALS = { Vega: totals.putVega, Delta: totals.putDelta };
+  const totalDp = (label) => (label === 'Delta' ? 3 : 2);
+
+  return (
+    <div className="scroll-thin max-h-[70vh] overflow-auto rounded-lg border border-vega-border">
+      <table className="w-full table-fixed border-collapse text-xs">
+        <colgroup>
+          {CALL_COLUMNS.map((label, i) => <col key={`c-${label}-${i}`} style={{ width: sideWidth }} />)}
+          <col style={{ width: '4%' }} />
+          {PUT_COLUMNS.map((label, i) => <col key={`p-${label}-${i}`} style={{ width: sideWidth }} />)}
+        </colgroup>
+
+        <thead className="sticky top-0 z-30 bg-vega-panel">
+          <tr className="border-b border-vega-border">
+            <th colSpan={callSpan} className="bg-vega-green/10 px-2 py-1.5 text-center text-[11px] font-semibold uppercase tracking-wider text-vega-green">
+              Calls
+            </th>
+            <th className="border-x border-vega-border bg-vega-panel-raised px-2 py-1.5 text-center text-[11px] font-semibold uppercase tracking-wider text-gray-400">
+              Strike
+            </th>
+            <th colSpan={putSpan} className="bg-vega-red/10 px-2 py-1.5 text-center text-[11px] font-semibold uppercase tracking-wider text-vega-red">
+              Puts
+            </th>
+          </tr>
+
+          <tr className="border-b border-vega-border bg-vega-panel">
+            {CALL_COLUMNS.map((label, i) => <Th key={`ch-${label}-${i}`}>{label}</Th>)}
+
+            <th className="border-x border-vega-border bg-vega-panel-raised px-3 py-2 text-center text-[11px] font-medium uppercase tracking-wide text-gray-400">
+              Price
+            </th>
+
+            {PUT_COLUMNS.map((label, i) => <Th key={`ph-${label}-${i}`}>{label}</Th>)}
+          </tr>
+        </thead>
+
+        <tbody>
+          {filteredRows.map((row) => (
+            <ChainRow
+              key={row.strike}
+              rowRef={row.isAtm ? atmRef : null}
+              row={row}
+              onSelect={onSelectStrike}
+            />
+          ))}
+
+          {/* Every strike filtered out — say so rather than showing a blank box. */}
+          {!filteredRows.length && (
+            <tr>
+              <td
+                colSpan={callSpan + 1 + putSpan}
+                className="px-3 py-8 text-center text-xs text-gray-500"
+              >
+                No strikes with a call delta between {band.call.min.toFixed(2)} and{' '}
+                {band.call.max.toFixed(2)} yet. Greeks appear once the feed solves IV
+                for these contracts.
+              </td>
+            </tr>
+          )}
+        </tbody>
+
+        {/* Column totals for the visible band, pinned to the bottom. */}
+        {totals.count > 0 && (
+          <tfoot className="sticky bottom-0 z-20 bg-vega-panel">
+            <tr className="border-t-2 border-vega-border">
+              {CALL_COLUMNS.map((label, i) => (
+                <td key={`ct-${label}-${i}`} className="num px-2 py-2 text-right text-[11px] font-semibold text-gray-200">
+                  {fmt(CALL_TOTALS[label], totalDp(label))}
+                </td>
+              ))}
+
+              <td className="border-x border-vega-border bg-vega-panel-raised px-3 py-2 text-center text-[10px] uppercase tracking-wide text-gray-500">
+                {totals.count}
+              </td>
+
+              {PUT_COLUMNS.map((label, i) => (
+                <td key={`pt-${label}-${i}`} className="num px-2 py-2 text-right text-[11px] font-semibold text-gray-200">
+                  {fmt(PUT_TOTALS[label], totalDp(label))}
+                </td>
+              ))}
+            </tr>
+          </tfoot>
+        )}
+      </table>
+    </div>
+  );
+}
