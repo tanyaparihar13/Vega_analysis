@@ -1,6 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createChart, ColorType, LineStyle, CrosshairMode } from 'lightweight-charts';
-import { SERIES_COLORS } from '../../features/vegaAnalysis/VegaChart';
 
 /**
  * The public, delayed Vega chart.
@@ -10,42 +9,71 @@ import { SERIES_COLORS } from '../../features/vegaAnalysis/VegaChart';
  * baseline — from `/api/public/vega/:symbol/delayed-series`.
  *
  * WHY THIS IS A SEPARATE COMPONENT FROM features/vegaAnalysis/VegaChart.
- * That one is a dense terminal instrument: crosshair readout panel, zoom
- * controls, series toggles, a height that tracks the viewport so it can sit
- * beside a 380px data table. This one is a marketing surface — bigger type,
- * more breathing room, no controls to get lost in, and a first-paint reveal
- * animation. Forking the presentation keeps both honest; the arithmetic is
- * shared because neither computes anything. Every value arrives already
- * calculated by vegaTimeseriesService.
+ * That one is a dense terminal instrument on a LIGHT surface: crosshair readout
+ * panel, zoom controls, series toggles, a height that tracks the viewport so it
+ * can sit beside a 380px data table. This one is a marketing surface on BLACK —
+ * bigger type, more breathing room, no controls to get lost in, and a
+ * first-paint reveal animation. Forking the presentation keeps both honest; the
+ * arithmetic is shared because neither computes anything. Every value arrives
+ * already calculated by vegaTimeseriesService.
  *
- * SERIES_COLORS is imported rather than redeclared so the teaser a visitor
- * sees and the chart they get after approval are the same colours.
+ * WHY THE COLOURS ARE DECLARED HERE RATHER THAN IMPORTED.
+ * The app's SERIES_COLORS (#0f7a46 / #c62828 / #41527a) are contrast-checked
+ * against a WHITE card, which is correct for the terminal and wrong here — on
+ * #050505 they are muddy and the slate Difference line all but disappears.
+ * Re-tuning them in the app's file would change the terminal, which this work
+ * must not touch, so the site carries its own palette with the same semantic
+ * mapping: green = calls, red = puts, blue = the difference between them.
  */
 
-const AXIS_TEXT = '#6b7280';
-const GRID_LINE = 'rgba(17,24,39,0.06)';
-const AXIS_LINE = 'rgba(17,24,39,0.12)';
+/** Site-only. Tuned for a near-black surface; do not use inside the app. */
+export const PUBLIC_SERIES_COLORS = {
+  call: '#00E676',
+  put: '#FF4D6D',
+  diff: '#00BFFF',
+};
+
+const AXIS_TEXT = '#93A3B4';
+const GRID_LINE = 'rgba(255,255,255,0.045)';
+const AXIS_LINE = 'rgba(255,255,255,0.10)';
+const CROSSHAIR = 'rgba(0,230,118,0.55)';
 
 const IST_TIME = new Intl.DateTimeFormat('en-IN', {
   hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Kolkata',
 });
 const fmtIst = (unixSeconds) => IST_TIME.format(new Date(unixSeconds * 1000));
 
-/** Marketing surface: taller and airier than the terminal chart at every step. */
-function heightFor(width) {
+/**
+ * Chart height.
+ *
+ * Two ladders, because the chart appears at two very different jobs:
+ *
+ *   hero   the full-bleed centrepiece under the headline. Tall enough to be
+ *          the thing you look at (640px on a desktop), but still tiered down
+ *          on a phone — a 640px canvas on a 375px screen is a wall, not a
+ *          chart, and it would push every CTA below the fold.
+ *   panel  a chart inside a normal card elsewhere on the site.
+ */
+function heightFor(width, variant) {
+  if (variant === 'hero') {
+    if (width < 480) return 340;
+    if (width < 768) return 420;
+    if (width < 1280) return 540;
+    return 640;
+  }
   if (width < 480) return 260;
   if (width < 768) return 300;
   if (width < 1280) return 360;
   return 420;
 }
 
-const REVEAL_MS = 900;
+const REVEAL_MS = 1200;
 
 const prefersReducedMotion = () =>
   typeof window !== 'undefined'
   && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
-function PublicVegaChart({ points, loading = false, emptyLabel }) {
+function PublicVegaChart({ points, loading = false, emptyLabel, variant = 'panel' }) {
   const wrapRef = useRef(null);
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -54,54 +82,55 @@ function PublicVegaChart({ points, loading = false, emptyLabel }) {
   // First paint gets the reveal animation; later polls just swap the data in,
   // otherwise the chart would replay its intro every 60 seconds.
   const hasRevealedRef = useRef(false);
+  // `applySize` closes over the variant, and the create-once effect depends on
+  // `applySize`. Holding the variant in a ref keeps that effect from tearing
+  // down and rebuilding the whole chart if the prop ever changes.
+  const variantRef = useRef(variant);
+  variantRef.current = variant;
 
   // Only the HEIGHT lives in React state, because only the height is rendered
   // (it reserves the wrapper's space). The chart's width is applied
   // imperatively via `appliedRef` below, so keeping it in state as well would
   // re-render the component on every pixel of a drag-resize for nothing.
-  const [height, setHeight] = useState(360);
+  const [height, setHeight] = useState(() => heightFor(1280, variant));
 
   // ---- responsive sizing -------------------------------------------------
   /**
-   * The size actually handed to the CURRENT chart object.
+   * TWO HALVES, EACH DOING ONLY WHAT IT IS GOOD AT.
    *
-   * This is the crux of the sizing logic, so it is worth being explicit about
-   * why React state is not enough on its own.
+   * 1. React owns the wrapper's HEIGHT, derived from the container's WIDTH
+   *    (`heightFor`). This is the part lightweight-charts cannot do for
+   *    itself — `autoSize` matches whatever box it is given, it has no opinion
+   *    about a 16:9-ish chart wanting to be shorter on a phone.
    *
-   * `size` describes what the layout should be. It does NOT describe what the
-   * live chart instance has been told, and the two come apart whenever a chart
-   * is created while `size` already holds the right numbers — which happens on
-   * every StrictMode remount in development, and any time the container
-   * reflows after the first measurement (late CSS, web fonts, the hero's
-   * entrance animation settling).
+   * 2. The chart's `autoSize` owns the CANVAS, matching the box React just
+   *    sized.
    *
-   * When that happens, `setSize` bails out because the value is unchanged, no
-   * effect re-runs, and a brand-new chart is left sitting at the library's
-   * default 150px width inside a 528px card. The symptom is a chart that
-   * renders correctly only after the window is resized.
+   * The previous version drove both halves by hand: it called
+   * `chart.resize(w, h)` and remembered the applied size in a ref so it could
+   * skip redundant calls. That is where the bug was. The moment the remembered
+   * pair matched what a later measurement computed, every subsequent call
+   * early-returned — including the one that was supposed to correct a chart
+   * that had ended up at a different size (an entrance animation still
+   * running, a StrictMode remount, a scrollbar appearing as the page filled).
+   * The chart then rendered 621px tall inside a 540px wrapper and no resize
+   * event could ever fix it, because the bookkeeping insisted it was already
+   * correct.
    *
-   * Tracking the applied size per chart instance — and resizing imperatively
-   * rather than as a side effect of a state change — closes that gap.
+   * Letting the library observe its own container removes the bookkeeping, and
+   * with it the entire class of "chart and its box disagree" bug.
    */
-  const appliedRef = useRef({ width: 0, height: 0 });
-
   const applySize = useCallback(() => {
     const el = wrapRef.current;
-    const chart = chartRef.current;
     if (!el) return;
 
     const width = Math.floor(el.getBoundingClientRect().width);
     if (!width) return;
-    const nextHeight = heightFor(width);
 
-    // Drives the wrapper so the card reserves the right space.
-    setHeight((prev) => (prev === nextHeight ? prev : nextHeight));
-
-    if (!chart) return;
-    if (appliedRef.current.width === width && appliedRef.current.height === nextHeight) return;
-    appliedRef.current = { width, height: nextHeight };
-    chart.resize(width, nextHeight);
-    chart.timeScale().fitContent();
+    setHeight((prev) => {
+      const next = heightFor(width, variantRef.current);
+      return prev === next ? prev : next;
+    });
   }, []);
 
   useLayoutEffect(() => {
@@ -134,12 +163,27 @@ function PublicVegaChart({ points, loading = false, emptyLabel }) {
     };
   }, [applySize]);
 
+  /**
+   * `autoSize` keeps the canvas matching its box, but it does not re-fit the
+   * visible time range — so after a tier change (phone rotated, window
+   * widened past a breakpoint) the curve would keep the old horizontal
+   * scaling inside a differently-shaped chart.
+   */
+  useEffect(() => {
+    if (!chartRef.current) return;
+    chartRef.current.timeScale().fitContent();
+  }, [height]);
+
   // ---- create once -------------------------------------------------------
   useEffect(() => {
     if (!containerRef.current) return undefined;
 
     const chart = createChart(containerRef.current, {
-      autoSize: false, // the sizing effect below owns both dimensions
+      // The container is `h-full w-full` inside a wrapper whose pixel height
+      // the effect above sets, so "match your container" is exactly right —
+      // and it is the library's own ResizeObserver doing it, which cannot fall
+      // out of step with the box the way a hand-rolled resize call did.
+      autoSize: true,
       layout: {
         background: { type: ColorType.Solid, color: 'transparent' },
         textColor: AXIS_TEXT,
@@ -153,12 +197,12 @@ function PublicVegaChart({ points, loading = false, emptyLabel }) {
       crosshair: {
         mode: CrosshairMode.Normal,
         vertLine: {
-          width: 1, color: 'rgba(37,99,235,0.4)',
-          style: LineStyle.Dashed, labelBackgroundColor: '#2563eb',
+          width: 1, color: CROSSHAIR,
+          style: LineStyle.Dashed, labelBackgroundColor: '#00E676',
         },
         horzLine: {
-          width: 1, color: 'rgba(37,99,235,0.4)',
-          style: LineStyle.Dashed, labelBackgroundColor: '#2563eb',
+          width: 1, color: CROSSHAIR,
+          style: LineStyle.Dashed, labelBackgroundColor: '#00E676',
         },
       },
       rightPriceScale: {
@@ -193,14 +237,16 @@ function PublicVegaChart({ points, loading = false, emptyLabel }) {
       lastValueVisible: true,
       crosshairMarkerRadius: 4,
       crosshairMarkerBorderWidth: 2,
-      crosshairMarkerBorderColor: '#ffffff',
+      // The marker's ring has to match the chart's own surface, not white, or
+      // every crosshair dot wears a bright halo on this theme.
+      crosshairMarkerBorderColor: '#0A0F14',
     };
 
     seriesRef.current = {
-      call: chart.addLineSeries({ ...common, color: SERIES_COLORS.call }),
-      put: chart.addLineSeries({ ...common, color: SERIES_COLORS.put }),
+      call: chart.addLineSeries({ ...common, color: PUBLIC_SERIES_COLORS.call }),
+      put: chart.addLineSeries({ ...common, color: PUBLIC_SERIES_COLORS.put }),
       diff: chart.addLineSeries({
-        ...common, color: SERIES_COLORS.diff, lineStyle: LineStyle.Dashed,
+        ...common, color: PUBLIC_SERIES_COLORS.diff, lineStyle: LineStyle.Dashed,
       }),
     };
 
@@ -208,7 +254,7 @@ function PublicVegaChart({ points, loading = false, emptyLabel }) {
     // reference line that gives the curve meaning.
     seriesRef.current.call.createPriceLine({
       price: 0,
-      color: 'rgba(17,24,39,0.35)',
+      color: 'rgba(255,255,255,0.30)',
       lineWidth: 1,
       lineStyle: LineStyle.Dotted,
       axisLabelVisible: false,
@@ -217,18 +263,15 @@ function PublicVegaChart({ points, loading = false, emptyLabel }) {
 
     chartRef.current = chart;
 
-    // A new chart knows nothing about any size already applied to its
-    // predecessor, so clear the record and size this one from the live DOM
-    // straight away. Without this the chart would keep the library's default
-    // dimensions until something else happened to trigger a resize.
-    appliedRef.current = { width: 0, height: 0 };
+    // Make sure the wrapper's height reflects the live container width before
+    // the first paint, rather than the initial guess this component mounted
+    // with.
     applySize();
 
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
       chart.remove();
       chartRef.current = null;
-      appliedRef.current = { width: 0, height: 0 };
     };
   }, [applySize]);
 
@@ -305,16 +348,18 @@ function PublicVegaChart({ points, loading = false, emptyLabel }) {
     <div ref={wrapRef} className="relative w-full" style={{ height }}>
       {loading && !hasPoints && (
         <div className="absolute inset-0 z-20 grid place-items-center">
-          <div className="flex items-center gap-2.5 text-sm font-medium text-text/50">
-            <span className="h-4 w-4 animate-spin rounded-full border-2 border-primary/25 border-t-primary" />
-            Loading chart…
+          <div className="flex flex-col items-center gap-3">
+            <span className="h-8 w-8 animate-spin rounded-full border-2 border-primary/20 border-t-primary" />
+            <span className="font-body text-sm font-medium text-muted">
+              Loading Vega series…
+            </span>
           </div>
         </div>
       )}
 
       {!loading && !hasPoints && emptyLabel && (
         <div className="absolute inset-0 z-10 grid place-items-center px-6">
-          <p className="max-w-sm text-center text-sm leading-relaxed text-text/50">{emptyLabel}</p>
+          <p className="max-w-md text-center text-sm leading-relaxed text-muted">{emptyLabel}</p>
         </div>
       )}
 

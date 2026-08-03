@@ -3,91 +3,114 @@ import { motion } from 'framer-motion';
 import { HiOutlineArrowRight } from 'react-icons/hi';
 import { FEATURES, PLATFORM_FACTS } from '../content';
 
+/**
+ * Features.
+ *
+ * The methodology block is the part that separates this from a generic
+ * screener, and the part a serious user will ask about — so it gets equal
+ * weight to the feature grid rather than being buried in a FAQ.
+ */
+
+const EASE = [0.22, 1, 0.36, 1];
+
+const METHOD = [
+  {
+    t: 'A day-open baseline is frozen each morning',
+    d: 'The first usable option chain of the session is stored per strike and held immutable for the rest of the day. Every number on the chart is a change from that reference, not an absolute.',
+  },
+  {
+    t: 'Implied volatility is solved from the traded price',
+    d: 'IV is backed out of each contract\'s LTP, then Delta, Gamma, Theta and Vega are computed with Black-76 against the futures forward.',
+  },
+  {
+    t: 'Strikes are re-selected every minute by delta',
+    d: 'Each minute the eligible Call and Put strikes are recomputed from the current chain within a |delta| band, then summed against the frozen morning chain.',
+  },
+  {
+    t: 'The three series are the differences',
+    d: 'Call Vega is current call vega minus its day-open value, Put Vega the same for puts, and Difference is put minus call. Their signs give the Bullish / Bearish / Sideways read.',
+  },
+  {
+    t: 'Every minute is written to disk',
+    d: 'Samples persist as they are taken, so history accumulates on its own and any past session can be replayed exactly as it happened.',
+  },
+];
+
 export default function Features() {
   return (
     <>
-      <section className="px-5 pb-12 pt-20 text-center sm:px-6">
-        <div className="mx-auto max-w-2xl">
+      <section className="relative px-5 pb-14 pt-20 text-center sm:px-8 sm:pt-28">
+        <motion.div
+          initial={{ opacity: 0, y: 26 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6, ease: EASE }}
+          className="mx-auto max-w-3xl"
+        >
           <span className="site-eyebrow">Features</span>
-          <h1 className="mt-3 font-display text-4xl font-bold text-text sm:text-5xl">
-            Everything in the terminal
+          <h1 className="mt-4 font-display text-4xl font-bold leading-tight tracking-tight text-text sm:text-5xl lg:text-6xl">
+            Everything in the{' '}
+            <span className="site-gradient-text">terminal</span>
           </h1>
-          <p className="mt-4 text-base leading-relaxed text-text/60 sm:text-lg">
+          <p className="mx-auto mt-6 max-w-2xl text-base leading-relaxed text-muted sm:text-lg">
             One focused tool for Indian index option analytics, running on your own
             Zerodha Kite session.
           </p>
-        </div>
+        </motion.div>
       </section>
 
-      <section className="px-5 pb-16 sm:px-6">
-        <div className="mx-auto grid max-w-6xl grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
+      <section className="relative px-5 pb-20 sm:px-8">
+        <div className="mx-auto grid max-w-[1400px] grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {FEATURES.map((f, i) => (
             <motion.div
               key={f.title}
-              initial={{ opacity: 0, y: 20 }}
+              initial={{ opacity: 0, y: 26 }}
               whileInView={{ opacity: 1, y: 0 }}
               viewport={{ once: true, amount: 0.2 }}
-              transition={{ duration: 0.4, delay: (i % 3) * 0.07 }}
-              className="site-card group p-6 transition-colors hover:border-primary/30"
+              transition={{ duration: 0.45, delay: (i % 3) * 0.08 }}
+              className="site-card-hover group p-7"
             >
-              <div className="mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-primary/10 text-primary transition-colors group-hover:bg-primary-gradient group-hover:text-white">
-                <f.icon size={22} />
+              <div className="mb-5 grid h-14 w-14 place-items-center rounded-2xl border border-primary/20 bg-primary/10 text-primary transition-all duration-300 group-hover:border-primary/50 group-hover:shadow-glow-emerald">
+                <f.icon size={25} />
               </div>
-              <h3 className="font-display text-base font-semibold text-text">{f.title}</h3>
-              <p className="mt-2 text-sm leading-relaxed text-text/55">{f.body}</p>
+              <h3 className="font-display text-lg font-bold text-text">{f.title}</h3>
+              <p className="mt-2.5 text-sm leading-relaxed text-muted">{f.body}</p>
             </motion.div>
           ))}
         </div>
       </section>
 
-      {/* How the numbers are produced — the part that separates this from a
-          generic screener, and the part a serious user will ask about. */}
-      <section className="border-y border-border bg-white px-5 py-20 sm:px-6">
+      {/* ---------- methodology ---------- */}
+      <section className="relative border-y border-white/[0.07] px-5 py-20 sm:px-8 sm:py-28">
         <div className="mx-auto max-w-4xl">
-          <div className="mb-10 text-center">
+          <motion.div
+            initial={{ opacity: 0, y: 24 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, amount: 0.3 }}
+            transition={{ duration: 0.55 }}
+            className="mb-12 text-center"
+          >
             <span className="site-eyebrow">Methodology</span>
-            <h2 className="mt-3 font-display text-3xl font-bold text-text sm:text-4xl">
+            <h2 className="mt-4 font-display text-3xl font-bold leading-tight tracking-tight text-text sm:text-4xl lg:text-5xl">
               How the Vega numbers are built
             </h2>
-          </div>
+          </motion.div>
 
           <ol className="space-y-4">
-            {[
-              {
-                t: 'A day-open baseline is frozen each morning',
-                d: 'The first usable option chain of the session is stored per strike and held immutable for the rest of the day. Every number on the chart is a change from that reference, not an absolute.',
-              },
-              {
-                t: 'Implied volatility is solved from the traded price',
-                d: 'IV is backed out of each contract\'s LTP, then Delta, Gamma, Theta and Vega are computed with Black-76 against the futures forward.',
-              },
-                            {
-                t: 'Strikes are re-selected every minute by delta',
-                d: 'Each minute the eligible Call and Put strikes are recomputed from the current chain within a |delta| band, then summed against the frozen morning chain.',
-              },
-              {
-                t: 'The three series are the differences',
-                d: 'Call Vega is current call vega minus its day-open value, Put Vega the same for puts, and Difference is put minus call. Their signs give the Bullish / Bearish / Sideways read.',
-              },
-              {
-                t: 'Every minute is written to disk',
-                d: 'Samples persist as they are taken, so history accumulates on its own and any past session can be replayed exactly as it happened.',
-              },
-            ].map((s, i) => (
+            {METHOD.map((s, i) => (
               <motion.li
                 key={s.t}
-                initial={{ opacity: 0, x: -12 }}
+                initial={{ opacity: 0, x: -16 }}
                 whileInView={{ opacity: 1, x: 0 }}
-                viewport={{ once: true, amount: 0.4 }}
-                transition={{ duration: 0.35, delay: i * 0.05 }}
-                className="site-surface-soft flex gap-4 rounded-2xl p-5"
+                viewport={{ once: true, amount: 0.35 }}
+                transition={{ duration: 0.4, delay: i * 0.06 }}
+                className="site-card flex gap-5 p-6"
               >
-                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary-gradient text-sm font-bold text-white">
+                <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-primary-gradient font-body text-sm font-bold text-[#04120a] shadow-glow-emerald">
                   {i + 1}
                 </span>
                 <div>
-                  <h3 className="font-display text-sm font-semibold text-text">{s.t}</h3>
-                  <p className="mt-1.5 text-sm leading-relaxed text-text/55">{s.d}</p>
+                  <h3 className="font-display text-base font-bold text-text">{s.t}</h3>
+                  <p className="mt-2 text-sm leading-relaxed text-muted">{s.d}</p>
                 </div>
               </motion.li>
             ))}
@@ -95,30 +118,41 @@ export default function Features() {
         </div>
       </section>
 
-      <section className="px-5 py-20 sm:px-6">
+      <section className="relative px-5 py-20 sm:px-8 sm:py-28">
         <div className="mx-auto max-w-5xl">
-          <div className="grid grid-cols-2 gap-6 sm:grid-cols-4">
-            {PLATFORM_FACTS.map((f) => (
-              <div key={f.label} className="site-card p-5 text-center">
-                <div className="font-display text-xl font-bold text-text sm:text-2xl">{f.value}</div>
-                <div className="mt-1 text-xs leading-snug text-text/50">{f.label}</div>
-              </div>
+          <div className="grid grid-cols-2 gap-5 sm:grid-cols-4">
+            {PLATFORM_FACTS.map((f, i) => (
+              <motion.div
+                key={f.label}
+                initial={{ opacity: 0, y: 20 }}
+                whileInView={{ opacity: 1, y: 0 }}
+                viewport={{ once: true, amount: 0.3 }}
+                transition={{ duration: 0.4, delay: i * 0.07 }}
+                className="site-card p-6 text-center"
+              >
+                <div className="font-display text-2xl font-bold text-text sm:text-3xl">
+                  {f.value}
+                </div>
+                <div className="mt-2 text-xs leading-snug text-muted">{f.label}</div>
+              </motion.div>
             ))}
           </div>
 
-          <div className="mt-12 text-center">
-            <h2 className="font-display text-2xl font-bold text-text sm:text-3xl">
+          <div className="mt-16 text-center">
+            <h2 className="font-display text-3xl font-bold tracking-tight text-text sm:text-4xl">
               Ready to see it live?
             </h2>
-            <p className="mx-auto mt-3 max-w-md text-sm leading-relaxed text-text/55">
+            <p className="mx-auto mt-4 max-w-md text-base leading-relaxed text-muted">
               Register for an account and an administrator will review it. The public
               chart on the home page is delayed by 30 minutes.
             </p>
-            <div className="mt-7 flex flex-wrap justify-center gap-3">
-              <Link to="/register" className="site-btn-primary">
-                Register Now <HiOutlineArrowRight size={18} />
+            <div className="mt-9 flex flex-wrap justify-center gap-4">
+              <Link to="/register" className="site-cta">
+                Open Account <HiOutlineArrowRight size={18} />
               </Link>
-              <Link to="/pricing" className="site-btn-outline">View Pricing</Link>
+              <Link to="/pricing" className="site-btn-outline !py-4 !text-base">
+                View Pricing
+              </Link>
             </div>
           </div>
         </div>

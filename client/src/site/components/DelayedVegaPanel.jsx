@@ -1,12 +1,15 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { HiOutlineClock, HiOutlineLockClosed } from 'react-icons/hi';
+import { motion } from 'framer-motion';
+import {
+  HiOutlineClock, HiOutlineLockClosed, HiOutlineInformationCircle, HiOutlineArrowRight,
+} from 'react-icons/hi';
 import publicApi from '../api/publicApi';
-import PublicVegaChart from './PublicVegaChart';
-import { SERIES_COLORS } from '../../features/vegaAnalysis/VegaChart';
+import PublicVegaChart, { PUBLIC_SERIES_COLORS } from './PublicVegaChart';
+import { useAuth } from '../../context/AuthContext';
 
 /**
- * The delayed NIFTY Vega chart shown to visitors who have not registered.
+ * The delayed NIFTY Vega chart — the centrepiece of the home page.
  *
  * Everything here is real recorded data from the Vega recorder — the same
  * per-minute rows the terminal serves — held back by the delay the server
@@ -14,9 +17,11 @@ import { SERIES_COLORS } from '../../features/vegaAnalysis/VegaChart';
  * series: when the recorder has nothing to show, this panel says so.
  *
  * TELLING THE TRUTH ABOUT WHAT IS ON SCREEN is the whole job of this
- * component's header. Three distinct states have to be distinguishable:
+ * component's header, and it matters more here than anywhere else on the site
+ * because this is the most persuasive surface the product has. Three distinct
+ * states have to be distinguishable at a glance:
  *
- *   today, delayed        "Today · delayed by 30 minutes"
+ *   today, delayed        "30 Min Delayed Market Data"
  *   previous session      "Last session · <date>"   (isFallbackDay)
  *   nothing recorded yet  empty state explaining the recorder has not run
  *
@@ -29,9 +34,9 @@ const SYMBOL = 'NIFTY';
 const POLL_MS = 60_000; // matches the server's per-minute sample cadence
 
 const SERIES_LEGEND = [
-  { key: 'call', label: 'Call Vega', color: SERIES_COLORS.call, dashed: false },
-  { key: 'put', label: 'Put Vega', color: SERIES_COLORS.put, dashed: false },
-  { key: 'diff', label: 'Difference', color: SERIES_COLORS.diff, dashed: true },
+  { key: 'call', label: 'Call Vega', color: PUBLIC_SERIES_COLORS.call, dashed: false },
+  { key: 'put', label: 'Put Vega', color: PUBLIC_SERIES_COLORS.put, dashed: false },
+  { key: 'diff', label: 'Difference', color: PUBLIC_SERIES_COLORS.diff, dashed: true },
 ];
 
 const fmtSigned = (v) => {
@@ -57,6 +62,7 @@ const fmtDateLong = (iso) => {
 };
 
 export default function DelayedVegaPanel() {
+  const { user } = useAuth();
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
@@ -87,100 +93,219 @@ export default function DelayedVegaPanel() {
   const isFallback = !!data?.isFallbackDay;
   const delay = data?.delayMinutes ?? 30;
 
+  // Where "Go Live Now" sends people. A signed-in user goes straight to the
+  // real terminal; everyone else enters the existing registration funnel. This
+  // is the app's own flow, unchanged.
+  const liveTarget = user
+    ? (user.role === 'admin' ? '/admin' : '/vega-analysis')
+    : '/register';
+
   const emptyLabel = failed
     ? 'The delayed chart is temporarily unavailable. Please try again shortly.'
     : `No Vega data has been recorded for ${SYMBOL} yet. The recorder samples every minute between 09:15 and 15:30 IST on trading days.`;
 
   return (
-    <div className="site-card overflow-hidden">
-      {/* ---------- header ---------- */}
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-3 border-b border-border px-5 py-4">
-        <div className="min-w-0">
-          <h3 className="font-display text-base font-bold text-text">
-            {SYMBOL} Vega Analysis
-          </h3>
-          <p className="mt-0.5 text-xs text-text/50">
-            Call &amp; Put vega vs the day-open baseline
+    <div className="site-ring shadow-[0_40px_120px_-40px_rgba(0,230,118,0.35)]">
+      <div className="site-ring-inner overflow-hidden">
+        {/* ================= header ================= */}
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-3 border-b border-white/[0.08] px-5 py-4 sm:px-7 sm:py-5">
+          <div className="min-w-0">
+            <h3 className="font-display text-lg font-bold tracking-tight text-text sm:text-xl">
+              {SYMBOL} Vega Analysis
+            </h3>
+            <p className="mt-0.5 text-xs text-muted sm:text-sm">
+              Call &amp; Put vega measured against the day-open baseline
+            </p>
+          </div>
+
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            {isFallback ? (
+              <span className="site-badge">
+                <HiOutlineClock size={13} />
+                Last session · {fmtDateLong(data?.date)}
+              </span>
+            ) : (
+              <DelayBadge minutes={delay} />
+            )}
+
+            {latest?.trend && (
+              <span
+                className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-3 py-1 text-xs font-bold uppercase tracking-wide"
+                style={{
+                  color: latest.trendColor,
+                  backgroundColor: `${latest.trendColor}1f`,
+                  border: `1px solid ${latest.trendColor}55`,
+                }}
+              >
+                <span
+                  className="h-1.5 w-1.5 rounded-full"
+                  style={{ background: latest.trendColor }}
+                />
+                {latest.trend}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* ================= headline numbers ================= */}
+        <div className="grid grid-cols-3 divide-x divide-white/[0.07] border-b border-white/[0.07]">
+          <Stat label="Call Vega" value={latest?.callVegaDiff} color={PUBLIC_SERIES_COLORS.call} />
+          <Stat label="Put Vega" value={latest?.putVegaDiff} color={PUBLIC_SERIES_COLORS.put} />
+          <Stat label="Difference" value={latest?.vegaDiff} color={PUBLIC_SERIES_COLORS.diff} />
+        </div>
+
+        {/* ================= legend ================= */}
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 px-5 pt-4 sm:px-7">
+          {SERIES_LEGEND.map((s) => (
+            <span key={s.key} className="flex items-center gap-2">
+              <span
+                className="h-0.5 w-5 shrink-0 rounded-full"
+                style={
+                  s.dashed
+                    ? { backgroundImage: `repeating-linear-gradient(to right, ${s.color} 0 5px, transparent 5px 9px)` }
+                    : { background: s.color, boxShadow: `0 0 8px ${s.color}` }
+                }
+              />
+              <span className="text-xs font-semibold" style={{ color: s.color }}>
+                {s.label}
+              </span>
+            </span>
+          ))}
+          {latest && (
+            <span className="ml-auto font-mono text-xs tabular-nums text-muted">
+              as of {fmtTime(latest.time)} IST
+            </span>
+          )}
+        </div>
+
+        {/* ================= chart + unlock overlay ================= */}
+        <div className="relative px-2 pb-3 pt-3 sm:px-4 sm:pb-4">
+          <PublicVegaChart
+            points={points}
+            loading={loading}
+            emptyLabel={emptyLabel}
+            variant="hero"
+          />
+
+          <UnlockCard to={liveTarget} signedIn={!!user} />
+        </div>
+
+        {/* ================= premium gate ================= */}
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-3 border-t border-white/[0.08] bg-[rgba(255,255,255,0.02)] px-5 py-4 sm:px-7">
+          <p className="flex max-w-2xl items-start gap-2.5 text-xs leading-relaxed text-muted sm:text-sm">
+            <HiOutlineLockClosed size={16} className="mt-0.5 shrink-0 text-primary" />
+            <span>
+              This chart is{' '}
+              <span className="font-semibold text-text">delayed by {delay} minutes</span>.
+              The live chart, historical sessions, option chain and full Greeks need an
+              approved account.
+            </span>
           </p>
+          <Link to={liveTarget} className="site-btn-primary ml-auto !px-5 !py-2.5 !text-sm">
+            {user ? 'Open Terminal' : 'Get Access'} <HiOutlineArrowRight size={15} />
+          </Link>
         </div>
-
-        <div className="ml-auto flex flex-wrap items-center gap-2">
-          {isFallback ? (
-            <span className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border border-border bg-slate-100 px-2.5 py-1 text-[11px] font-semibold text-text/60">
-              <HiOutlineClock size={13} />
-              Last session · {fmtDateLong(data?.date)}
-            </span>
-          ) : (
-            <span className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border border-accent/30 bg-accent/10 px-2.5 py-1 text-[11px] font-semibold text-accent">
-              <HiOutlineClock size={13} />
-              Delayed {delay} min
-            </span>
-          )}
-
-          {latest?.trend && (
-            <span
-              className="inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-1 text-[11px] font-bold uppercase tracking-wide"
-              style={{
-                color: latest.trendColor,
-                backgroundColor: `${latest.trendColor}17`,
-                border: `1px solid ${latest.trendColor}59`,
-              }}
-            >
-              <span className="h-1.5 w-1.5 rounded-full" style={{ background: latest.trendColor }} />
-              {latest.trend}
-            </span>
-          )}
-        </div>
-      </div>
-
-      {/* ---------- headline numbers ---------- */}
-      <div className="grid grid-cols-3 divide-x divide-border border-b border-border">
-        <Stat label="Call Vega" value={latest?.callVegaDiff} color={SERIES_COLORS.call} />
-        <Stat label="Put Vega" value={latest?.putVegaDiff} color={SERIES_COLORS.put} />
-        <Stat label="Difference" value={latest?.vegaDiff} color={SERIES_COLORS.diff} />
-      </div>
-
-      {/* ---------- legend ---------- */}
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-5 pt-4">
-        {SERIES_LEGEND.map((s) => (
-          <span key={s.key} className="flex items-center gap-1.5">
-            <span
-              className="h-0.5 w-4 shrink-0 rounded-full"
-              style={
-                s.dashed
-                  ? { backgroundImage: `repeating-linear-gradient(to right, ${s.color} 0 4px, transparent 4px 7px)` }
-                  : { background: s.color }
-              }
-            />
-            <span className="text-xs font-semibold" style={{ color: s.color }}>{s.label}</span>
-          </span>
-        ))}
-        {latest && (
-          <span className="ml-auto text-[11px] font-medium text-text/40">
-            as of {fmtTime(latest.time)} IST
-          </span>
-        )}
-      </div>
-
-      {/* ---------- chart ---------- */}
-      <div className="px-2 pb-2 pt-3 sm:px-3 sm:pb-3">
-        <PublicVegaChart points={points} loading={loading} emptyLabel={emptyLabel} />
-      </div>
-
-      {/* ---------- premium gate ---------- */}
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-3 border-t border-border bg-slate-50 px-5 py-4">
-        <p className="flex items-start gap-2 text-xs leading-relaxed text-text/60">
-          <HiOutlineLockClosed size={15} className="mt-px shrink-0 text-primary" />
-          <span>
-            This chart is <span className="font-semibold text-text/80">delayed by {delay} minutes</span>.
-            The live chart, historical sessions, option chain and full Greeks need an approved account.
-          </span>
-        </p>
-        <Link to="/register" className="site-btn-primary ml-auto !px-5 !py-2.5 text-sm">
-          Get Access
-        </Link>
       </div>
     </div>
+  );
+}
+
+/**
+ * The delay disclosure, with an explanation behind an info affordance.
+ *
+ * Hover alone would hide the explanation from every touch and keyboard user, so
+ * the tooltip is driven by `open` state toggled on click AND revealed by
+ * `focus-within` — which covers tab navigation without any extra handlers.
+ */
+function DelayBadge({ minutes }) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <span className="relative">
+      <span className="site-badge !border-primary/30 !text-primary" style={{ backgroundColor: 'rgba(0,230,118,0.10)' }}>
+        <HiOutlineClock size={13} />
+        {minutes} Min Delayed Market Data
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          onMouseEnter={() => setOpen(true)}
+          onMouseLeave={() => setOpen(false)}
+          aria-label="Why is this data delayed?"
+          aria-expanded={open}
+          className="ml-0.5 rounded-full text-primary/70 transition-colors hover:text-primary"
+        >
+          <HiOutlineInformationCircle size={15} />
+        </button>
+      </span>
+
+      {open && (
+        <motion.span
+          initial={{ opacity: 0, y: -6 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.18 }}
+          role="tooltip"
+          className="absolute right-0 top-[calc(100%+0.5rem)] z-30 block w-64 rounded-xl border border-white/10 bg-[rgba(8,12,16,0.97)] p-3.5 text-xs leading-relaxed text-muted shadow-card backdrop-blur-xl"
+        >
+          The public chart is the real NIFTY Vega series, published{' '}
+          <span className="font-semibold text-text">{minutes} minutes behind the market</span>.
+          Live values, historical sessions and the option chain are part of the
+          subscription.
+        </motion.span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * "Unlock Live Vega Analysis".
+ *
+ * Floats over the top-right of the chart on large screens — where it overlaps
+ * the emptiest part of a Vega curve — and drops to a normal block below the
+ * chart under `lg`, because a 320px card floating over a 340px-tall phone chart
+ * would cover the very thing it is advertising.
+ */
+function UnlockCard({ to, signedIn }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: 18, scale: 0.97 }}
+      whileInView={{ opacity: 1, y: 0, scale: 1 }}
+      viewport={{ once: true, amount: 0.4 }}
+      transition={{ duration: 0.5, delay: 0.35, ease: [0.22, 1, 0.36, 1] }}
+      className="relative mx-1 mt-3 lg:absolute lg:right-8 lg:top-10 lg:z-20 lg:mx-0 lg:mt-0 lg:w-[330px] lg:animate-float"
+    >
+      <div className="rounded-2xl border border-primary/25 bg-[rgba(8,13,17,0.92)] p-5 shadow-glow backdrop-blur-2xl">
+        <div className="flex items-center gap-2">
+          <span className="relative flex h-2 w-2">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-70" />
+            <span className="relative inline-flex h-2 w-2 rounded-full bg-primary" />
+          </span>
+          <span className="text-[11px] font-bold uppercase tracking-[0.16em] text-primary">
+            Live access
+          </span>
+        </div>
+
+        <h4 className="mt-3 font-display text-lg font-bold leading-snug text-text">
+          Unlock Live Vega Analysis
+        </h4>
+        <p className="mt-2 text-sm leading-relaxed text-muted">
+          Get real-time Vega charts, option analytics, and instant market updates.
+        </p>
+
+        <Link
+          to={to}
+          className="site-cta mt-5 w-full !py-3 !text-[15px]"
+        >
+          {signedIn ? 'Open Live Terminal' : 'Go Live Now'}
+          <HiOutlineArrowRight size={17} />
+        </Link>
+
+        {!signedIn && (
+          <p className="mt-2.5 text-center text-[11px] text-muted/80">
+            Accounts are activated after administrator approval.
+          </p>
+        )}
+      </div>
+    </motion.div>
   );
 }
 
@@ -189,15 +314,18 @@ function Stat({ label, value, color }) {
   const hasValue = value != null && !Number.isNaN(n);
 
   return (
-    <div className="px-4 py-3.5 sm:px-5">
-      <div className="text-[11px] font-semibold uppercase tracking-wider text-text/45">
+    <div className="px-4 py-4 sm:px-7 sm:py-5">
+      <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted">
         {label}
       </div>
       <div
-        className="mt-1 font-mono text-lg font-bold tabular-nums sm:text-xl"
-        style={{ color: hasValue ? color : undefined }}
+        className="mt-1.5 font-mono text-xl font-bold tabular-nums sm:text-2xl"
+        style={{
+          color: hasValue ? color : undefined,
+          textShadow: hasValue ? `0 0 22px ${color}55` : undefined,
+        }}
       >
-        {hasValue ? fmtSigned(value) : <span className="text-text/30">–</span>}
+        {hasValue ? fmtSigned(value) : <span className="text-muted/40">–</span>}
       </div>
     </div>
   );

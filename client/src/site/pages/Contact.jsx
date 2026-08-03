@@ -1,15 +1,15 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import {
   HiOutlineMail, HiOutlinePhone, HiOutlineChatAlt2, HiOutlineExternalLink,
 } from 'react-icons/hi';
-import publicApi from '../api/publicApi';
+import useSiteConfig from '../hooks/useSiteConfig';
 
 /**
  * Contact.
  *
- * THE FORM ACTUALLY SENDS SOMETHING NOW. The version this replaces set a
+ * THE FORM ACTUALLY SENDS SOMETHING. The version this replaces set a
  * `submitted` flag and rendered "Thanks — your message has been sent!" while
  * doing nothing at all: no request, no mail, no record. A confirmation for a
  * message that was never transmitted is worse than having no form.
@@ -19,18 +19,17 @@ import publicApi from '../api/publicApi';
  * already uses. The visitor sees their message in WhatsApp and presses Send
  * themselves; nothing is transmitted on their behalf. If an email address is
  * configured, a mailto alternative is offered alongside it.
+ *
+ * Every channel comes from the server's own config, so a channel that has not
+ * been set up simply does not appear.
  */
 
+const EASE = [0.22, 1, 0.36, 1];
+
 export default function Contact() {
-  const [config, setConfig] = useState(null);
+  const config = useSiteConfig();
   const [form, setForm] = useState({ name: '', email: '', subject: '', message: '' });
   const [handedOff, setHandedOff] = useState(false);
-
-  useEffect(() => {
-    publicApi.get('/site-config')
-      .then(({ data }) => setConfig(data))
-      .catch(() => setConfig({ adminWhatsappNumber: null, contactEmail: null, contactPhone: null }));
-  }, []);
 
   const change = (e) => setForm((f) => ({ ...f, [e.target.name]: e.target.value }));
 
@@ -81,24 +80,29 @@ export default function Contact() {
 
   return (
     <>
-      <section className="px-5 pb-12 pt-20 text-center sm:px-6">
-        <div className="mx-auto max-w-2xl">
+      <section className="relative px-5 pb-14 pt-20 text-center sm:px-8 sm:pt-28">
+        <motion.div
+          initial={{ opacity: 0, y: 26 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6, ease: EASE }}
+          className="mx-auto max-w-3xl"
+        >
           <span className="site-eyebrow">Contact</span>
-          <h1 className="mt-3 font-display text-4xl font-bold text-text sm:text-5xl">
-            Get in touch
+          <h1 className="mt-4 font-display text-4xl font-bold leading-tight tracking-tight text-text sm:text-5xl lg:text-6xl">
+            Get in <span className="site-gradient-text">touch</span>
           </h1>
-          <p className="mt-4 text-base leading-relaxed text-text/60 sm:text-lg">
+          <p className="mx-auto mt-6 max-w-2xl text-base leading-relaxed text-muted sm:text-lg">
             Questions about access, approval or the platform? Message us on WhatsApp —
             it is the fastest way to reach us.
           </p>
-        </div>
+        </motion.div>
       </section>
 
       {channels.length > 0 && (
-        <section className="px-5 pb-16 sm:px-6">
+        <section className="relative px-5 pb-16 sm:px-8">
           <div
             className={`mx-auto grid max-w-4xl grid-cols-1 gap-5 ${
-              channels.length === 1 ? 'max-w-md' : channels.length === 2 ? 'sm:grid-cols-2' : 'sm:grid-cols-3'
+              channels.length === 1 ? '!max-w-md' : channels.length === 2 ? 'sm:grid-cols-2' : 'sm:grid-cols-3'
             }`}
           >
             {channels.map((c, i) => (
@@ -106,19 +110,19 @@ export default function Contact() {
                 key={c.label}
                 href={c.href}
                 {...(c.external ? { target: '_blank', rel: 'noopener noreferrer' } : {})}
-                initial={{ opacity: 0, y: 18 }}
+                initial={{ opacity: 0, y: 22 }}
                 whileInView={{ opacity: 1, y: 0 }}
                 viewport={{ once: true, amount: 0.3 }}
-                transition={{ duration: 0.35, delay: i * 0.08 }}
-                className="site-card group flex flex-col items-center p-7 text-center transition-colors hover:border-primary/30"
+                transition={{ duration: 0.4, delay: i * 0.08 }}
+                className="site-card-hover group flex flex-col items-center p-8 text-center"
               >
-                <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-xl bg-primary/10 text-primary transition-colors group-hover:bg-primary-gradient group-hover:text-white">
-                  <c.icon size={24} />
+                <div className="mb-5 grid h-14 w-14 place-items-center rounded-2xl border border-primary/20 bg-primary/10 text-primary transition-all duration-300 group-hover:border-primary/50 group-hover:shadow-glow-emerald">
+                  <c.icon size={25} />
                 </div>
-                <h3 className="font-display text-xs font-semibold uppercase tracking-wider text-text/45">
+                <h3 className="font-body text-xs font-bold uppercase tracking-[0.18em] text-muted">
                   {c.label}
                 </h3>
-                <p className="mt-2 break-all font-display text-sm font-semibold text-text">
+                <p className="mt-2.5 break-all font-body text-sm font-semibold text-text">
                   {c.value}
                 </p>
               </motion.a>
@@ -127,25 +131,32 @@ export default function Contact() {
         </section>
       )}
 
-      <section className="px-5 pb-24 sm:px-6">
+      <section className="relative px-5 pb-24 sm:px-8">
         <div className="mx-auto max-w-2xl">
-          <div className="mb-8 text-center">
+          <motion.div
+            initial={{ opacity: 0, y: 24 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, amount: 0.25 }}
+            transition={{ duration: 0.5 }}
+            className="mb-9 text-center"
+          >
             <span className="site-eyebrow">Send a message</span>
-            <h2 className="mt-3 font-display text-3xl font-bold text-text sm:text-4xl">
+            <h2 className="mt-4 font-display text-3xl font-bold tracking-tight text-text sm:text-4xl">
               Write to us
             </h2>
-          </div>
+          </motion.div>
 
-          <div className="site-card p-7 sm:p-8">
+          <div className="site-card p-7 sm:p-9">
             {!config ? (
-              <p className="py-10 text-center text-sm text-text/45">Loading contact options…</p>
+              <p className="py-10 text-center text-sm text-muted">Loading contact options…</p>
             ) : !whatsappUrl ? (
               <div className="py-8 text-center">
-                <p className="text-sm text-text/60">
-                  No contact channel is configured yet.
-                </p>
-                <p className="mt-2 text-xs text-text/45">
-                  Set <code className="rounded bg-slate-100 px-1.5 py-0.5">ADMIN_WHATSAPP_NUMBER</code>{' '}
+                <p className="text-sm text-muted">No contact channel is configured yet.</p>
+                <p className="mt-2.5 text-xs text-muted/80">
+                  Set{' '}
+                  <code className="rounded bg-white/[0.07] px-1.5 py-0.5 font-mono text-text">
+                    ADMIN_WHATSAPP_NUMBER
+                  </code>{' '}
                   in the server environment to enable this form.
                 </p>
               </div>
@@ -182,18 +193,18 @@ export default function Contact() {
                   </Field>
 
                   <button type="submit" className="site-btn-primary w-full">
-                    <HiOutlineChatAlt2 size={17} /> Open in WhatsApp
+                    <HiOutlineChatAlt2 size={18} /> Open in WhatsApp
                   </button>
 
-                  <p className="text-center text-xs leading-relaxed text-text/45">
+                  <p className="text-center text-xs leading-relaxed text-muted/80">
                     This opens WhatsApp with your message filled in. You press{' '}
-                    <span className="font-medium text-text/70">Send</span> — nothing is
+                    <span className="font-semibold text-text">Send</span> — nothing is
                     sent on your behalf.
                   </p>
                 </form>
 
                 {handedOff && (
-                  <p className="mt-5 rounded-xl border border-success/30 bg-success/10 px-4 py-3 text-center text-sm text-success">
+                  <p className="mt-6 rounded-xl border border-primary/25 bg-primary/10 px-4 py-3.5 text-center text-sm text-primary">
                     WhatsApp should have opened. If it did not,{' '}
                     <a
                       href={whatsappUrl} target="_blank" rel="noopener noreferrer"
@@ -206,9 +217,12 @@ export default function Contact() {
                 )}
 
                 {mailtoUrl && (
-                  <p className="mt-5 border-t border-border pt-5 text-center text-xs text-text/50">
+                  <p className="mt-6 border-t border-white/[0.08] pt-6 text-center text-xs text-muted">
                     Prefer email?{' '}
-                    <a href={mailtoUrl} className="inline-flex items-center gap-1 font-semibold text-primary hover:underline">
+                    <a
+                      href={mailtoUrl}
+                      className="inline-flex items-center gap-1 font-semibold text-primary hover:underline"
+                    >
                       Send this as an email <HiOutlineExternalLink size={13} />
                     </a>
                   </p>
@@ -217,12 +231,12 @@ export default function Contact() {
             )}
           </div>
 
-          <p className="mt-8 text-center text-sm text-text/55">
+          <p className="mt-9 text-center text-sm text-muted">
             Looking to get access?{' '}
             <Link to="/register" className="font-semibold text-primary hover:underline">
-              Register here
+              Open an account
             </Link>{' '}
-            and an administrator will review your account.
+            and an administrator will review it.
           </p>
         </div>
       </section>
@@ -233,7 +247,9 @@ export default function Contact() {
 function Field({ label, children }) {
   return (
     <div>
-      <label className="mb-1.5 block text-xs font-medium text-text/60">{label}</label>
+      <label className="mb-2 block text-xs font-semibold uppercase tracking-wider text-muted">
+        {label}
+      </label>
       {children}
     </div>
   );

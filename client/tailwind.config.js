@@ -92,48 +92,83 @@ export default {
         },
 
         /**
-         * PUBLIC WEBSITE TOKENS (src/site/**).
+         * PUBLIC WEBSITE TOKENS (src/site/**) — DARK LUXURY FINTECH.
          *
-         * The marketing site has its own visual language — gradients, larger
-         * radii, Poppins display type — that deliberately does NOT match the
-         * dense terminal look of the app. Rather than run a second Tailwind
-         * build, its palette lives here alongside the app's.
+         * The marketing site has its own visual language that deliberately does
+         * NOT match the dense light terminal look of the app: deep black,
+         * emerald/teal/electric-blue neon, glassmorphism, Playfair headings.
+         * Rather than run a second Tailwind build, its palette lives here
+         * alongside the app's.
          *
-         * PURELY ADDITIVE. Every name below was grepped across all 35 app
-         * source files before being added and appears in none of them, so no
-         * existing class changes meaning. Do not reuse these inside the
-         * dashboard/admin — use the vega-* / ink-* scales there.
+         * SCOPED, NOT SHARED. Every name in this block was grepped across all
+         * app source files: `primary`, `secondary`, `accent`, `background`,
+         * `card`, `border`, `text`, `muted`, `success`, `danger`, `gold`,
+         * `plasma`, `surface`, `surface-2`, `hairline` appear ONLY inside
+         * src/site/** and the `site-` rules in index.css. Re-pointing them from
+         * the old light values to these dark ones therefore converts the whole
+         * marketing site at once and cannot reach the dashboard, the admin
+         * console or the auth screens — those use the vega-* / ink-* scales,
+         * which are untouched.
+         *
+         * Do not reuse these inside the dashboard/admin.
          */
-        primary: '#2563eb',
-        secondary: '#0ea5e9',
-        accent: '#f59e0b',
-        background: '#f8fafc',
-        card: '#ffffff',
-        border: '#e5e7eb',
-        text: '#111827',
-        muted: '#6b7280',
-        success: '#16a34a',
-        danger: '#dc2626',
-        gold: '#f59e0b',
+        primary: '#00E676',       // emerald — primary action, Call Vega, "live"
+        secondary: '#00FFC6',     // neon teal — gradient partner, highlights
+        accent: '#00BFFF',        // electric blue — data accents, links
+        plasma: '#A855F7',        // purple glow — tertiary depth in the mesh
+        background: '#050505',    // deep black page field
+        surface: '#0A0F14',       // raised glass base
+        'surface-2': '#111820',   // second elevation (hover, nested panels)
+        card: '#0A0F14',
+        border: '#1B2530',        // hairline on dark
+        hairline: '#1B2530',
+        text: '#EAF2F7',          // primary copy — 15.8:1 on #050505
+        muted: '#93A3B4',         // secondary copy — 7.4:1 on #050505
+        success: '#00E676',
+        danger: '#FF4D6D',
+        gold: '#F0B90B',
       },
 
       fontFamily: {
         sans: ['Inter', '"Segoe UI Variable"', '"Segoe UI"', 'system-ui', '-apple-system', 'sans-serif'],
         mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', '"Cascadia Mono"', 'monospace'],
-        // Public website only. `sans` stays the app's default, so adding these
-        // two changes nothing until a component opts in with font-display /
+        // Public website only. `sans` stays the app's default, so these two
+        // change nothing until a component opts in with font-display /
         // font-body.
-        display: ['Poppins', 'Inter', 'system-ui', 'sans-serif'],
+        //
+        // `display` is the large elegant serif the marketing headings use.
+        // It is NOT for buttons or micro-labels — those stay on font-body
+        // (Inter), which is why the site-btn-* rules in index.css say so
+        // explicitly.
+        display: ['"Playfair Display"', 'Georgia', 'Cambria', 'Times New Roman', 'serif'],
         body: ['Inter', 'system-ui', 'sans-serif'],
       },
 
       // Public website gradients. No `backgroundImage` key existed before, so
       // this adds utilities rather than replacing any.
       backgroundImage: {
+        // The page field's ambient light. Deliberately low-alpha: it has to
+        // read as depth behind content, never as colour on top of it.
         'grid-glow':
-          'radial-gradient(circle at 20% 20%, rgba(37,99,235,0.06), transparent 45%), radial-gradient(circle at 80% 0%, rgba(14,165,233,0.06), transparent 40%)',
-        'primary-gradient': 'linear-gradient(135deg, #2563eb 0%, #0ea5e9 100%)',
-        'gold-gradient': 'linear-gradient(135deg, #f59e0b 0%, #fbbf24 100%)',
+          'radial-gradient(ellipse 80% 55% at 50% -10%, rgba(0,230,118,0.13), transparent 60%),'
+          + 'radial-gradient(ellipse 60% 45% at 88% 8%, rgba(0,191,255,0.10), transparent 62%),'
+          + 'radial-gradient(ellipse 55% 45% at 8% 22%, rgba(168,85,247,0.09), transparent 60%)',
+        'primary-gradient': 'linear-gradient(135deg, #00E676 0%, #00FFC6 52%, #00BFFF 100%)',
+        'gold-gradient': 'linear-gradient(135deg, #F0B90B 0%, #FFD75E 100%)',
+        // Emerald -> teal -> blue -> purple, used by the animated conic border
+        // on hero cards and the CTA sweep.
+        'aurora-ring':
+          'conic-gradient(from 0deg, #00E676, #00FFC6, #00BFFF, #A855F7, #00E676)',
+        // The diagonal light that travels across the primary CTA.
+        'sheen':
+          'linear-gradient(105deg, transparent 38%, rgba(255,255,255,0.55) 50%, transparent 62%)',
+        // Faint technical grid — the "trading terminal" texture under the hero.
+        'tech-grid':
+          'linear-gradient(rgba(255,255,255,0.028) 1px, transparent 1px),'
+          + 'linear-gradient(90deg, rgba(255,255,255,0.028) 1px, transparent 1px)',
+        // Glass highlight: a card's top edge catching light.
+        'glass-sheen':
+          'linear-gradient(180deg, rgba(255,255,255,0.07) 0%, rgba(255,255,255,0.02) 22%, transparent 55%)',
       },
 
       fontSize: {
@@ -159,12 +194,20 @@ export default {
         'glow-cyan': '0 0 0 1px rgba(29, 78, 216, 0.25), 0 2px 12px -2px rgba(29, 78, 216, 0.28)',
         // Sticky table headers need a real edge or rows appear to slide over them.
         'sticky-head': '0 1px 0 0 rgba(15,23,42,0.10), 0 6px 10px -8px rgba(15,23,42,0.35)',
-        // Public website elevation — softer and wider than the app's, which is
-        // tuned for dense panels sitting edge to edge.
-        glow: '0 8px 24px rgba(37,99,235,0.18)',
-        'glow-emerald': '0 8px 24px rgba(14,165,233,0.15)',
-        card: '0 4px 20px rgba(15,23,42,0.06)',
-        'card-hover': '0 12px 32px rgba(15,23,42,0.10)',
+        // Public website elevation. On black, "elevation" is light, not
+        // shadow — so each of these pairs a real drop shadow (which separates
+        // the card from the field) with a coloured bloom (which is what reads
+        // as premium).
+        glow: '0 10px 34px -8px rgba(0,230,118,0.45), 0 0 0 1px rgba(0,230,118,0.16)',
+        'glow-emerald': '0 0 44px -10px rgba(0,230,118,0.55)',
+        'glow-teal': '0 0 44px -10px rgba(0,255,198,0.50)',
+        'glow-blue': '0 0 44px -10px rgba(0,191,255,0.48)',
+        'glow-plasma': '0 0 48px -12px rgba(168,85,247,0.50)',
+        // The continuous halo on the "Watch Live Vega" button, at rest.
+        'cta-rest': '0 0 0 1px rgba(0,230,118,0.35), 0 8px 30px -6px rgba(0,230,118,0.42), 0 0 60px -18px rgba(0,255,198,0.5)',
+        'cta-hot': '0 0 0 1px rgba(0,255,198,0.55), 0 14px 44px -8px rgba(0,230,118,0.62), 0 0 90px -16px rgba(0,255,198,0.7)',
+        card: '0 18px 48px -22px rgba(0,0,0,0.95), inset 0 1px 0 0 rgba(255,255,255,0.055)',
+        'card-hover': '0 26px 70px -24px rgba(0,0,0,1), 0 0 0 1px rgba(0,230,118,0.22), inset 0 1px 0 0 rgba(255,255,255,0.09)',
       },
 
       transitionProperty: {
@@ -175,14 +218,70 @@ export default {
         'vega-shimmer': {
           '100%': { transform: 'translateX(100%)' },
         },
-        // Public website hero motion.
+        // Public website motion. Every one of these is decorative — nothing
+        // here conveys state, so the global prefers-reduced-motion rule in
+        // index.css can safely flatten all of them.
         float: {
           '0%, 100%': { transform: 'translateY(0px)' },
           '50%': { transform: 'translateY(-12px)' },
         },
+        'float-sm': {
+          '0%, 100%': { transform: 'translateY(0px)' },
+          '50%': { transform: 'translateY(-6px)' },
+        },
         pulseGlow: {
           '0%, 100%': { opacity: 1 },
           '50%': { opacity: 0.6 },
+        },
+        // Hero background mesh. Translate + scale only (both compositor
+        // properties) so the blobs never trigger layout or paint.
+        'aurora-a': {
+          '0%, 100%': { transform: 'translate3d(0,0,0) scale(1)' },
+          '33%': { transform: 'translate3d(6%, -4%, 0) scale(1.14)' },
+          '66%': { transform: 'translate3d(-5%, 5%, 0) scale(0.92)' },
+        },
+        'aurora-b': {
+          '0%, 100%': { transform: 'translate3d(0,0,0) scale(1.05)' },
+          '40%': { transform: 'translate3d(-8%, 6%, 0) scale(0.9)' },
+          '75%': { transform: 'translate3d(7%, 3%, 0) scale(1.2)' },
+        },
+        'aurora-c': {
+          '0%, 100%': { transform: 'translate3d(0,0,0) scale(0.95)' },
+          '50%': { transform: 'translate3d(5%, 7%, 0) scale(1.18)' },
+        },
+        // Ticker. -50% because the strip renders its content twice; see
+        // .site-marquee in index.css.
+        marquee: {
+          from: { transform: 'translate3d(0,0,0)' },
+          to: { transform: 'translate3d(-50%,0,0)' },
+        },
+        // The travelling highlight on the primary CTA.
+        sweep: {
+          '0%': { transform: 'translateX(-130%)' },
+          '55%, 100%': { transform: 'translateX(130%)' },
+        },
+        // Breathing halo behind the CTA and the "Go Live Now" button.
+        'halo-pulse': {
+          '0%, 100%': { opacity: '0.55', transform: 'scale(1)' },
+          '50%': { opacity: '1', transform: 'scale(1.06)' },
+        },
+        'ring-spin': {
+          to: { transform: 'rotate(360deg)' },
+        },
+        'grid-pan': {
+          from: { backgroundPosition: '0 0' },
+          to: { backgroundPosition: '48px 48px' },
+        },
+        // Particle drift for the hero starfield.
+        'drift-up': {
+          '0%': { transform: 'translateY(0)', opacity: '0' },
+          '12%': { opacity: '0.85' },
+          '85%': { opacity: '0.5' },
+          '100%': { transform: 'translateY(-120px)', opacity: '0' },
+        },
+        // Skeleton / loading shimmer on the dark surfaces.
+        'shimmer-x': {
+          '100%': { transform: 'translateX(100%)' },
         },
       },
 
@@ -190,7 +289,21 @@ export default {
       // is new and cannot shadow one of them.
       animation: {
         float: 'float 6s ease-in-out infinite',
+        'float-sm': 'float-sm 5s ease-in-out infinite',
         pulseGlow: 'pulseGlow 2.5s ease-in-out infinite',
+        'aurora-a': 'aurora-a 26s ease-in-out infinite',
+        'aurora-b': 'aurora-b 32s ease-in-out infinite',
+        'aurora-c': 'aurora-c 38s ease-in-out infinite',
+        marquee: 'marquee 46s linear infinite',
+        'marquee-slow': 'marquee 78s linear infinite',
+        sweep: 'sweep 3.6s ease-in-out infinite',
+        'halo-pulse': 'halo-pulse 2.8s ease-in-out infinite',
+        'ring-spin': 'ring-spin 6s linear infinite',
+        'grid-pan': 'grid-pan 9s linear infinite',
+        // Duration and delay are overridden per particle inline, so the value
+        // here only has to be a sane default.
+        'drift-up': 'drift-up 18s linear infinite',
+        'shimmer-x': 'shimmer-x 1.6s ease-in-out infinite',
       },
     },
   },
