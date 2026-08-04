@@ -5,9 +5,11 @@ import {
 } from 'react-icons/tb';
 import api from '../../api/axios';
 import VegaChart, { SERIES_COLORS } from './VegaChart';
+import InstrumentSelector from './InstrumentSelector';
+import useVegaStream from './useVegaStream';
 
 /**
- * Vega Analysis — date-wise + expiry-wise historical workspace.
+ * Vega Analysis — instrument-, expiry-, timeframe- and date-wise workspace.
  *
  * Every number is computed server-side (vegaTimeseriesService + vegaMath) and
  * only read here; this component never sums vega.
@@ -36,11 +38,39 @@ import VegaChart, { SERIES_COLORS } from './VegaChart';
  * including contracts that have since expired and are gone from the instrument
  * master. Resolving that on the server keeps the dropdown honest — it can only
  * offer an expiry that will actually return data.
+ *
+ * ===========================================================================
+ * TWO SOURCES, ONE ARRAY
+ * ===========================================================================
+ * Points arrive from exactly one of two places, never both:
+ *
+ *   today   the WebSocket stream (useVegaStream) — the server pushes one point
+ *           per timeframe period, so a 5s chart moves every five seconds and a
+ *           15m chart every fifteen minutes, with no polling at all.
+ *   history the REST series endpoint, fetched once per {instrument, expiry,
+ *           timeframe, date}.
+ *
+ * `points` below picks between them, and the chart, the table, the tiles and
+ * the tooltip all render from that ONE array. There is no path where the chart
+ * reads a live value and the table reads a fetched one, which is what makes
+ * them identical rather than merely usually-consistent.
  */
 
-const SYMBOLS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'SENSEX'];
-const TIMEFRAMES = ['1m', '3m', '5m', '15m'];
-const POLL_MS = 60_000; // matches the server's per-minute sample cadence
+const POLL_MS = 60_000;
+
+/**
+ * Timeframes, grouped the way a desk says them.
+ *
+ * Seconds tiers only have history where the recorder stores 5s rows (indices);
+ * for a stock they are live-only, and the server reports which tiers a given day
+ * can actually serve so the picker can disable the rest instead of returning an
+ * empty chart.
+ */
+const TIMEFRAME_GROUPS = [
+  { label: 'Seconds', options: ['5s', '10s', '15s', '30s'] },
+  { label: 'Minutes', options: ['1m', '3m', '5m', '10m', '15m'] },
+];
+const ALL_TIMEFRAMES = TIMEFRAME_GROUPS.flatMap((g) => g.options);
 
 const SERIES_META = [
   { key: 'call', label: 'Call Vega', color: SERIES_COLORS.call },
@@ -107,26 +137,52 @@ function TrendBadge({ label, color, size = 'md' }) {
   );
 }
 
-function Segmented({ options, value, onChange, ariaLabel }) {
+/**
+ * Timeframe picker, split into Seconds and Minutes.
+ *
+ * A tier the current session cannot serve is DISABLED with the reason in its
+ * title, not hidden. Hiding it would make the control silently change shape
+ * between an index and a stock, and leave a user wondering where 15s went; a
+ * greyed button that says "1m history cannot make a 15s bar" answers the
+ * question where it is asked.
+ */
+function TimeframePicker({ value, onChange, servable }) {
+  const canUse = (tf) => !servable || servable.includes(tf);
+
   return (
-    <div
-      role="group"
-      aria-label={ariaLabel}
-      className="flex overflow-hidden rounded-lg border border-vega-border bg-vega-panel-muted p-0.5"
-    >
-      {options.map((option) => (
-        <button
-          key={option}
-          onClick={() => onChange(option)}
-          aria-pressed={value === option}
-          className={`flex-1 rounded-md px-2.5 py-1.5 text-xs font-bold transition-colors sm:px-3 ${
-            value === option
-              ? 'bg-vega-panel text-vega-blue shadow-sm'
-              : 'text-ink-600 hover:text-ink-900'
-          }`}
-        >
-          {option}
-        </button>
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5" role="group" aria-label="Chart timeframe">
+      {TIMEFRAME_GROUPS.map((group) => (
+        <div key={group.label} className="flex items-center gap-1.5">
+          <span className="hidden text-2xs font-bold uppercase tracking-wider text-ink-400 lg:inline">
+            {group.label}
+          </span>
+          <div className="flex overflow-hidden rounded-lg border border-vega-border bg-vega-panel-muted p-0.5">
+            {group.options.map((option) => {
+              const usable = canUse(option);
+              const active = value === option;
+              return (
+                <button
+                  key={option}
+                  onClick={() => usable && onChange(option)}
+                  disabled={!usable}
+                  aria-pressed={active}
+                  title={usable
+                    ? `${option} bars`
+                    : `${option} is not available for this session — the stored data is too coarse`}
+                  className={`rounded-md px-2 py-1.5 text-xs font-bold transition-colors ${
+                    active
+                      ? 'bg-vega-panel text-vega-blue shadow-sm'
+                      : usable
+                        ? 'text-ink-600 hover:text-ink-900'
+                        : 'cursor-not-allowed text-ink-300'
+                  }`}
+                >
+                  {option}
+                </button>
+              );
+            })}
+          </div>
+        </div>
       ))}
     </div>
   );
@@ -499,6 +555,10 @@ function ExpirySelector({ expiries, value, onChange, loading }) {
 export default function VegaAnalysis() {
   const [symbol, setSymbol] = useState('NIFTY');
   const [timeframe, setTimeframe] = useState('1m');
+  // The instrument catalogue: indices + every F&O stock. Fetched ONCE per
+  // mount, then filtered in the browser — a per-keystroke search endpoint would
+  // be ~200 requests to re-derive a list already in memory.
+  const [catalogue, setCatalogue] = useState({ indices: [], stocks: [], loading: true, error: null });
   // Seeded from the browser, then corrected by the server's IST date as soon
   // as /dates answers.
   const [today, setToday] = useState(browserTodayIst);
@@ -530,6 +590,38 @@ export default function VegaAnalysis() {
   const scope = `${symbol}|${date}`;
   const expiryReady = expiryState.scope === scope;
   const expiry = expiryReady ? expiryState.value : null;
+
+  // ---- instrument catalogue (once) --------------------------------------
+  useEffect(() => {
+    let cancelled = false;
+    api.get('/vega/instruments')
+      .then(({ data: d }) => {
+        if (cancelled) return;
+        setCatalogue({
+          indices: d.indices || [],
+          stocks: d.stocks || [],
+          loading: false,
+          error: d.ready === false ? d.message : null,
+        });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setCatalogue({
+          indices: [], stocks: [], loading: false,
+          error: err.response?.data?.message || 'Could not load the instrument list',
+        });
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  // ---- live stream (today only) -----------------------------------------
+  /**
+   * A historical date has nothing to stream, so the hook is disabled and no
+   * socket traffic happens at all — the server never subscribes tokens for a
+   * user who is reading last Tuesday.
+   */
+  const streamEnabled = isToday && expiryReady && !!expiry;
+  const stream = useVegaStream({ symbol, expiry, timeframe, enabled: streamEnabled });
 
   // ---- expiries for the current {symbol, date} --------------------------
   useEffect(() => {
@@ -594,17 +686,27 @@ export default function VegaAnalysis() {
     }
   }, [symbol, timeframe, date, expiry]);
 
+  /**
+   * The live tail comes from the socket, so REST is fetched ONCE per selection
+   * — it is what supplies the day-open panel, the delta band and the baseline
+   * flags, which the stream does not carry.
+   *
+   * Polling survives only as a fallback for when the stream is not healthy (no
+   * token, socket refused, server without a Kite session). With the stream up,
+   * a 5s chart costs zero HTTP requests, which is the point.
+   */
+  const streamHealthy = streamEnabled && !!stream.meta && !stream.error;
+
   useEffect(() => {
     if (!expiryReady) return undefined; // wait for the expiry list for this scope
     setLoading(true);
     load();
-    // Only poll for TODAY — a past day is finished, re-fetching it is waste.
-    if (isToday) {
+    if (isToday && !streamHealthy) {
       const id = setInterval(load, POLL_MS);
       return () => clearInterval(id);
     }
     return undefined;
-  }, [load, isToday, expiryReady]);
+  }, [load, isToday, expiryReady, streamHealthy]);
 
   // Days that actually have stored data, for the picker. Re-read on symbol
   // change and after each date change, so a day that has just gained its first
@@ -627,13 +729,46 @@ export default function VegaAnalysis() {
     return () => { cancelled = true; };
   }, [symbol, date, today]);
 
-  const points = data?.points ?? [];
+  /**
+   * THE single array. Live when the socket is healthy, stored otherwise.
+   *
+   * Chart, table, tiles and tooltip all read this one value, so there is no
+   * arrangement of state in which they can disagree — synchronisation is a
+   * property of the data flow here, not something kept up by effects.
+   */
+  const points = streamHealthy ? stream.points : (data?.points ?? []);
   const latest = points.length ? points[points.length - 1] : null;
   const tableRows = useMemo(() => [...points].reverse(), [points]); // newest first
 
   const toggle = (key) => setVisible((v) => ({ ...v, [key]: !v[key] }));
 
-  const selectSymbol = (s) => { setSymbol(s); setDate(today); };
+  const selectSymbol = useCallback((s) => {
+    setSymbol(s);
+    setDate(today);
+  }, [today]);
+
+  const selectedInstrument = useMemo(
+    () => [...catalogue.indices, ...catalogue.stocks].find((i) => i.symbol === symbol) || null,
+    [catalogue, symbol]
+  );
+
+  /**
+   * Which timeframes this session can actually serve.
+   *
+   * Live is always all of them — the sampler runs at the 5s base clock for
+   * anything being watched, whatever its persist resolution. History is limited
+   * by what was stored, and the server says which tiers those rows can build.
+   */
+  const servableTimeframes = streamHealthy ? ALL_TIMEFRAMES : (data?.servableTimeframes ?? ALL_TIMEFRAMES);
+
+  // Never sit on a timeframe the current session cannot produce — stepping from
+  // a live index at 5s to a stock's stored history would otherwise show an
+  // empty chart with a perfectly valid-looking control.
+  useEffect(() => {
+    if (servableTimeframes.length && !servableTimeframes.includes(timeframe)) {
+      setTimeframe(servableTimeframes.includes('1m') ? '1m' : servableTimeframes[0]);
+    }
+  }, [servableTimeframes, timeframe]);
 
   const sessionForDate = sessions.find((s) => s.date === date);
 
@@ -687,24 +822,43 @@ export default function VegaAnalysis() {
         </div>
       </div>
 
-      {/* ---------- Symbol tabs ---------- */}
-      {/* Horizontal scroll instead of wrapping: five 100px chips wrap into two
-          ragged rows on a phone, which reads as broken. */}
-      <div className="scroll-thin -mx-3 flex gap-2 overflow-x-auto px-3 pb-1 sm:mx-0 sm:flex-wrap sm:px-0 sm:pb-0">
-        {SYMBOLS.map((s) => (
-          <button
-            key={s}
-            onClick={() => selectSymbol(s)}
-            aria-pressed={symbol === s}
-            className={`shrink-0 rounded-lg px-3.5 py-2 text-xs font-bold tracking-wide transition-colors sm:text-sm ${
-              symbol === s
-                ? 'bg-vega-blue text-white shadow-sm'
-                : 'border border-vega-border bg-vega-panel text-ink-700 hover:border-vega-border-strong hover:text-ink-900'
-            }`}
-          >
-            {s}
-          </button>
-        ))}
+      {/* ---------- Instrument + quick index tabs ----------
+          The five indices keep their one-tap chips because they are what most
+          sessions start on; the selector beside them reaches the other ~209
+          F&O names. Both write the same `symbol` state. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <InstrumentSelector
+          indices={catalogue.indices}
+          stocks={catalogue.stocks}
+          value={symbol}
+          onChange={selectSymbol}
+          loading={catalogue.loading}
+          error={catalogue.error}
+        />
+
+        <div className="scroll-thin -mx-3 flex gap-2 overflow-x-auto px-3 pb-1 sm:mx-0 sm:flex-wrap sm:px-0 sm:pb-0">
+          {catalogue.indices.map((i) => (
+            <button
+              key={i.symbol}
+              onClick={() => selectSymbol(i.symbol)}
+              aria-pressed={symbol === i.symbol}
+              className={`shrink-0 rounded-lg px-3.5 py-2 text-xs font-bold tracking-wide transition-colors sm:text-sm ${
+                symbol === i.symbol
+                  ? 'bg-vega-blue text-white shadow-sm'
+                  : 'border border-vega-border bg-vega-panel text-ink-700 hover:border-vega-border-strong hover:text-ink-900'
+              }`}
+            >
+              {i.symbol}
+            </button>
+          ))}
+        </div>
+
+        {selectedInstrument?.category === 'stock' && (
+          <span className="pill border-vega-border bg-vega-panel-muted text-ink-600">
+            {selectedInstrument.exchange}
+            {selectedInstrument.lotSize ? ` · lot ${selectedInstrument.lotSize}` : ''}
+          </span>
+        )}
       </div>
 
       {/* ---------- Toolbar ---------- */}
@@ -720,21 +874,16 @@ export default function VegaAnalysis() {
         />
 
         <div className="flex flex-wrap items-center gap-3">
-          <div className="flex items-center gap-2">
-            <span className="hidden text-2xs font-bold uppercase tracking-wider text-ink-500 sm:inline">
-              Timeframe
-            </span>
-            <Segmented
-              options={TIMEFRAMES}
-              value={timeframe}
-              onChange={setTimeframe}
-              ariaLabel="Chart timeframe"
-            />
-          </div>
+          <TimeframePicker
+            value={timeframe}
+            onChange={setTimeframe}
+            servable={servableTimeframes}
+          />
 
-          {/* Changing this refetches the series for the chosen contract; the
-              chart, the table and every tile below re-render from that one
-              response, so they move together by construction. */}
+          {/* Changing this re-subscribes (live) or refetches (historical) for
+              the chosen contract; the chart, the table and every tile below
+              re-render from that one array, so they move together by
+              construction. */}
           <ExpirySelector
             expiries={expiryOptions}
             value={activeExpiry}
@@ -865,9 +1014,10 @@ export default function VegaAnalysis() {
               <VegaChart
                 points={points}
                 visible={visible}
-                loading={loading}
+                loading={loading && !points.length}
                 emptyLabel={error ? null : emptyMessage}
                 onHoverPoint={setHoverTime}
+                instrument={symbol}
               />
             </div>
           </section>

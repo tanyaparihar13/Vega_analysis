@@ -15,14 +15,29 @@ const RISK_FREE_RATE = Number(process.env.RISK_FREE_RATE || 0.065);
  * a broadcast interval.
  */
 function buildChain({ symbol, expiry, latestTicks, oiBaseline = null, strikeWindow = 20 }) {
-  const cfg = getUnderlying(symbol);
+  /**
+   * RESOLVED THROUGH instrumentService, NOT constants.getUnderlying.
+   *
+   * constants/instruments.js is the curated table of five indices. The
+   * instrument master additionally carries every equity F&O name discovered in
+   * the option dump (RELIANCE, APLAPOLLO, ADANIPORTS...), each with an inferred
+   * strike step and a spot token matched from the cash segment.
+   *
+   * Resolving against only the curated five made this function throw 404 for
+   * every stock, which is why nothing downstream — chain, Greeks, Vega — could
+   * serve one. resolveUnderlying checks the curated table FIRST and falls back
+   * to the derived names, so index behaviour is bit-for-bit what it was and
+   * stocks simply start working. Nothing is removed.
+   */
+  const cfg = instrumentService.resolveUnderlying(symbol) || getUnderlying(symbol);
   if (!cfg) {
     const err = new Error(`Unknown underlying: ${symbol}`);
     err.statusCode = 404;
     throw err;
   }
 
-  const spotTick = latestTicks.get(cfg.spotToken);
+  // A derived underlying whose cash listing never matched has no spot token.
+  const spotTick = cfg.spotToken != null ? latestTicks.get(cfg.spotToken) : null;
   const spot = spotTick?.lastPrice ?? null;
 
   const { strikes, byStrike } = instrumentService.getStrikeMap(symbol, expiry);

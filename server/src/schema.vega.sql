@@ -21,7 +21,7 @@ USE vega_analysis;
 -- ---------------------------------------------------
 CREATE TABLE IF NOT EXISTS vega_day_open (
   snapshot_date DATE        NOT NULL,
-  symbol        VARCHAR(20) NOT NULL,
+  symbol        VARCHAR(32) NOT NULL,
   expiry        DATE        NOT NULL,
   captured_at   DATETIME    NOT NULL,
 
@@ -48,9 +48,21 @@ CREATE TABLE IF NOT EXISTS vega_day_open (
 -- ---------------------------------------------------
 CREATE TABLE IF NOT EXISTS vega_timeseries (
   snapshot_date     DATE          NOT NULL,
-  symbol            VARCHAR(20)   NOT NULL,
+  symbol            VARCHAR(32)   NOT NULL,
   sampled_at        DATETIME      NOT NULL,
   expiry            DATE          NOT NULL,
+
+  -- The resolution these rows were RECORDED at ('5s' for indices, '1m' for
+  -- stocks). It is part of the key because a symbol can legitimately hold rows
+  -- at more than one resolution — an instrument promoted to the recorded set,
+  -- or a config change mid-history — and the read path picks the finest
+  -- resolution that divides the requested timeframe.
+  resolution        VARCHAR(4)    NOT NULL DEFAULT '1m',
+
+  -- The at-the-money strike at sample time. Not an input to the vega sums
+  -- (those span the whole delta band); stored so the chart tooltip can name the
+  -- strike the board was centred on without rebuilding a historical chain.
+  atm_strike        DECIMAL(14,4) DEFAULT NULL,
 
   call_vega_diff    DECIMAL(16,4) NOT NULL DEFAULT 0,
   put_vega_diff     DECIMAL(16,4) NOT NULL DEFAULT 0,
@@ -69,8 +81,8 @@ CREATE TABLE IF NOT EXISTS vega_timeseries (
   -- Expiry joins the key so the same minute can hold one row per tracked
   -- expiry. Without it the second expiry sampled in a minute would collide with
   -- the first and be silently overwritten by the ON DUPLICATE KEY UPDATE.
-  PRIMARY KEY (snapshot_date, symbol, expiry, sampled_at),
-  INDEX idx_vega_series (symbol, snapshot_date, expiry, sampled_at)
+  PRIMARY KEY (snapshot_date, symbol, expiry, resolution, sampled_at),
+  INDEX idx_vega_series (symbol, snapshot_date, expiry, resolution, sampled_at)
 ) ENGINE=InnoDB;
 
 -- ---------------------------------------------------
@@ -81,7 +93,7 @@ CREATE TABLE IF NOT EXISTS vega_timeseries (
 -- ---------------------------------------------------
 CREATE TABLE IF NOT EXISTS vega_chain_snapshots (
   snapshot_date DATE        NOT NULL,
-  symbol        VARCHAR(20) NOT NULL,
+  symbol        VARCHAR(32) NOT NULL,
   sampled_at    DATETIME    NOT NULL,
   expiry        DATE        NOT NULL,
   chain         JSON        NOT NULL,
@@ -181,5 +193,86 @@ SET @s := IF(@c = 0,
   'ALTER TABLE vega_chain_snapshots
      DROP INDEX idx_chain_snap,
      ADD INDEX idx_chain_snap (symbol, snapshot_date, expiry, sampled_at)',
+  'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- ===================================================================
+-- MULTI-RESOLUTION UPGRADE, for databases created before `resolution`
+-- and `atm_strike` existed.
+--
+-- Same guarded, idempotent shape as the expiry upgrade above. The default on
+-- `resolution` is '1m', which is exactly what every pre-existing row is — the
+-- sampler wrote once a minute — so the backfill is correct by construction and
+-- no historical row changes meaning.
+--
+-- `symbol` also widens to VARCHAR(32): the column was sized for five index
+-- names and now has to hold F&O stock tradingsymbols. Widening a VARCHAR is an
+-- in-place metadata change in MySQL 8 and cannot truncate existing values.
+-- ===================================================================
+
+SET @c := (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'vega_timeseries'
+             AND COLUMN_NAME = 'resolution');
+SET @s := IF(@c = 0,
+  'ALTER TABLE vega_timeseries
+     ADD COLUMN resolution VARCHAR(4) NOT NULL DEFAULT ''1m'' AFTER expiry,
+     ADD COLUMN atm_strike DECIMAL(14,4) DEFAULT NULL AFTER resolution',
+  'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- Resolution joins the key only after the column exists, hence a second guard.
+SET @c := (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'vega_timeseries'
+             AND INDEX_NAME = 'PRIMARY'
+             AND COLUMN_NAME = 'resolution');
+SET @s := IF(@c = 0,
+  'ALTER TABLE vega_timeseries
+     DROP PRIMARY KEY,
+     ADD PRIMARY KEY (snapshot_date, symbol, expiry, resolution, sampled_at)',
+  'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @c := (SELECT COUNT(*) FROM information_schema.STATISTICS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'vega_timeseries'
+             AND INDEX_NAME = 'idx_vega_series'
+             AND COLUMN_NAME = 'resolution');
+SET @s := IF(@c = 0,
+  'ALTER TABLE vega_timeseries
+     DROP INDEX idx_vega_series,
+     ADD INDEX idx_vega_series (symbol, snapshot_date, expiry, resolution, sampled_at)',
+  'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+-- Stock tradingsymbols do not fit VARCHAR(20) reliably.
+SET @c := (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'vega_timeseries'
+             AND COLUMN_NAME = 'symbol'
+             AND CHARACTER_MAXIMUM_LENGTH < 32);
+SET @s := IF(@c > 0,
+  'ALTER TABLE vega_timeseries MODIFY symbol VARCHAR(32) NOT NULL',
+  'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @c := (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'vega_day_open'
+             AND COLUMN_NAME = 'symbol'
+             AND CHARACTER_MAXIMUM_LENGTH < 32);
+SET @s := IF(@c > 0,
+  'ALTER TABLE vega_day_open MODIFY symbol VARCHAR(32) NOT NULL',
+  'SELECT 1');
+PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+
+SET @c := (SELECT COUNT(*) FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = DATABASE()
+             AND TABLE_NAME = 'vega_chain_snapshots'
+             AND COLUMN_NAME = 'symbol'
+             AND CHARACTER_MAXIMUM_LENGTH < 32);
+SET @s := IF(@c > 0,
+  'ALTER TABLE vega_chain_snapshots MODIFY symbol VARCHAR(32) NOT NULL',
   'SELECT 1');
 PREPARE stmt FROM @s; EXECUTE stmt; DEALLOCATE PREPARE stmt;

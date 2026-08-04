@@ -6,54 +6,63 @@ const optionChainService = require('./optionChainService');
 const instrumentService = require('./instrumentService');
 const chainSnapshotStore = require('./chainSnapshotStore');
 const subscriptionManager = require('./subscriptionManager');
-const { getUnderlying, UNDERLYINGS } = require('../constants/instruments');
+const constants = require('../constants/instruments');
 const cfg = require('../config/vegaConfig');
 const { computePoint, pickStrikes } = require('../utils/vegaMath');
 const { classifyTrend } = require('../utils/vegaTrend');
 
+const { UNDERLYINGS } = constants;
+
 /**
  * Vega Analysis — a faithful port of the PHP `addvega.php` algorithm onto the
  * Zerodha + Node stack. The arithmetic lives in utils/vegaMath.js; this module
- * builds the chains, freezes the day-open baseline, samples every minute, and
+ * builds the chains, freezes the day-open baseline, samples on a clock, and
  * persists / serves the series. The Bullish/Bearish/Sideways label is derived
  * on read by utils/vegaTrend.js (datav1.php rules).
  *
- * WHAT CHANGED FOR PARITY (vs the previous version of this file):
- *   1. STRIKE SELECTION IS NOW DYNAMIC. Every minute the eligible Call/Put
- *      strike lists are recomputed from the CURRENT chain (cfg.STRIKE_MODE
- *      'dynamic'), then looked up in the frozen day-open chain — exactly like
- *      addvega.php. The old behaviour (freeze the lists at open) is still
- *      available as cfg.STRIKE_MODE 'frozen'.
- *   2. THE DAY-OPEN BASELINE NOW STORES THE FULL PER-STRIKE CHAIN, not just
- *      summed totals, because a dynamic strike set must be re-summed against
- *      the morning chain each minute.
- *   3. All thresholds / timings / modes come from config/vegaConfig.js.
+ * ===========================================================================
+ * THE THREE AXES
+ * ===========================================================================
+ * A series is identified by {symbol, expiry} and stored at a RESOLUTION.
+ * Everything below follows from keeping those separate:
  *
- * ---------------------------------------------------------------------------
- * EXPIRY-WISE (this revision)
- * ---------------------------------------------------------------------------
- * The engine used to be hard-wired to `expiries[0]` — the front expiry — in
- * five separate places, so there was exactly one series per underlying and no
- * way to ask for the next weekly. Everything is now keyed by
- * {symbol, expiry}:
+ *   symbol      any tradable underlying — the five indices AND every F&O stock
+ *               in Kite's instrument master. Resolved through
+ *               instrumentService.resolveUnderlying, not the five-name
+ *               constants table, which is what makes stocks work at all.
+ *   expiry      one immutable day-open baseline and one series per expiry.
+ *   resolution  what was WRITTEN to MySQL: 5s for indices, 1m for stocks
+ *               (cfg.PERSIST_RESOLUTION). Timeframes are aggregated up from it
+ *               on read; a resolution can only serve a timeframe that is a
+ *               whole multiple of it.
  *
- *   state              Map<'SYMBOL|YYYY-MM-DD', { open, series }>
- *   ensureSubscriptions  subscribes the CE/PE tokens of EVERY tracked expiry
- *   captureDayOpen     one immutable 09:15 baseline PER EXPIRY
- *   sampleAll          one row per {symbol, expiry} per minute
- *   the read API       takes an expiry and resolves a sensible default
+ * ===========================================================================
+ * WHAT IS SAMPLED, AND HOW OFTEN
+ * ===========================================================================
+ * The clock ticks every 5 seconds (cfg.SAMPLE_CRON). On each tick the active
+ * set is:
  *
- * How many expiries are tracked is cfg.EXPIRY_COUNT (nearest first) — see the
- * token-budget note there before raising it.
+ *   RECORDED   the five indices plus cfg.RECORDED_STOCKS — sampled with nobody
+ *              watching, which is the whole point of a recorder. This is what
+ *              has history.
+ *   ON DEMAND  whatever connected clients have selected (registerDemand, called
+ *              by vegaStreamService). Sampled at the full 5s clock so a live
+ *              seconds chart works for any of ~200 F&O stocks without any of
+ *              them costing anything when nobody is looking.
  *
- * The arithmetic itself is untouched: each expiry runs the same vegaMath
- * computePoint() against its own day-open chain, so switching expiry in the UI
- * changes WHICH series you read, never HOW it was calculated.
+ * A target is only COMPUTED on a tick if it is being watched or the tick is
+ * aligned to its persist resolution. So a recorded stock costs one chain build
+ * a minute, not twelve, and the faster clock is paid for only where a faster
+ * series is actually consumed.
+ *
+ * The arithmetic is untouched by any of this: every target runs the same
+ * vegaMath computePoint() against its own day-open chain. Changing instrument,
+ * expiry or timeframe changes WHICH series you read, never HOW it was
+ * calculated.
  *
  * Greeks note: PHP got Greeks pre-baked from Upstox. Here they are computed by
  * optionChainService.buildChain() (IV solved from LTP, then Black-Scholes).
- * Same methodology, different source — see the final report for why the
- * numbers cannot be byte-identical.
+ * Same methodology, different source.
  */
 
 // --- diagnostic logging (throttled to once/min per distinct reason) --------
@@ -68,15 +77,61 @@ function vlog(reason, force = false) {
 // 'SYMBOL|YYYY-MM-DD' -> { symbol, expiry, open: <baseline|null>, series: [rawPoint] }
 const state = new Map();
 
+/**
+ * On-demand targets: demandKey -> { symbol, expiry }.
+ *
+ * A demandKey is owned by whoever registered it (vegaStreamService uses one per
+ * connected client). Registering replaces that owner's previous target, so a
+ * client switching instrument can never leave the old one being sampled — which
+ * is the "unsubscribe old tokens, subscribe new tokens" half of Feature 8, and
+ * the reason this is a keyed map rather than a set.
+ */
+const demand = new Map();
+
 let sampleTask = null;
 let latestTicksRef = null;
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Symbol / resolution helpers
 // ---------------------------------------------------------------------------
 
-function startFor(symbol) {
-  return cfg.DELTA_START[String(symbol || '').toUpperCase()] ?? cfg.DEFAULT_START;
+/**
+ * Resolve any tradable underlying — index OR F&O stock.
+ *
+ * constants.getUnderlying knows five names. instrumentService also knows every
+ * equity name discovered in the option master, which is the difference between
+ * "NIFTY works" and "APLAPOLLO works".
+ */
+function resolveSymbol(symbol) {
+  if (!symbol) return null;
+  return instrumentService.resolveUnderlying(String(symbol).toUpperCase());
+}
+
+/** Curated index (fixed five) vs derived F&O stock. Drives persist resolution. */
+function isIndex(symbol) {
+  return !!constants.getUnderlying(symbol);
+}
+
+function persistResolutionFor(symbol) {
+  return isIndex(symbol) ? cfg.PERSIST_RESOLUTION.index : cfg.PERSIST_RESOLUTION.stock;
+}
+
+function tfSeconds(timeframe) {
+  return cfg.TIMEFRAMES[timeframe] || null;
+}
+
+/**
+ * Can rows recorded at `resolution` be aggregated into `timeframe`?
+ *
+ * Only when the timeframe is a whole multiple of the resolution. 5s rows make
+ * any tier; 1m rows cannot make a 30s bar out of nothing. Stated once here so
+ * the read path, the picker and the error message can never disagree about it.
+ */
+function canServe(resolution, timeframe) {
+  const r = tfSeconds(resolution);
+  const t = tfSeconds(timeframe);
+  if (!r || !t) return false;
+  return t >= r && t % r === 0;
 }
 
 /** Normalise any expiry representation (Date, DATETIME string, ISO) to YYYY-MM-DD. */
@@ -95,16 +150,20 @@ function stateKey(symbol, expiry) {
   return `${String(symbol).toUpperCase()}|${expiryKey(expiry)}`;
 }
 
+function startFor(symbol) {
+  return cfg.DELTA_START[String(symbol || '').toUpperCase()] ?? cfg.DEFAULT_START;
+}
+
 /**
- * The expiries this recorder tracks for one underlying, nearest first.
+ * The expiries tracked for one underlying, nearest first.
  *
  * Derived from the live instrument master rather than stored anywhere, so an
  * expiry rollover needs no intervention: the moment the expired contract drops
  * out of instrumentService, the window slides forward by one and the next
- * weekly starts being sampled (with its own day-open captured at that point).
+ * expiry starts being sampled (with its own day-open captured at that point).
  */
 function trackedExpiries(symbol) {
-  const c = getUnderlying(symbol);
+  const c = resolveSymbol(symbol);
   if (!c || !instrumentService.isReady()) return [];
   return instrumentService.getExpiries(c.key)
     .map(expiryKey)
@@ -115,11 +174,89 @@ function trackedExpiries(symbol) {
 /** Expiries currently held in memory for one symbol, nearest first. */
 function memoryExpiries(symbol) {
   const key = String(symbol).toUpperCase();
-  return [...state.values()]
-    .filter((e) => e.symbol === key)
-    .map((e) => e.expiry)
-    .sort();
+  return [...state.values()].filter((e) => e.symbol === key).map((e) => e.expiry).sort();
 }
+
+/**
+ * Symbols the recorder samples with nobody watching: the five indices, plus any
+ * stock named in cfg.RECORDED_STOCKS that actually resolves to a live chain.
+ * An unknown or delisted name in the env var is skipped with one warning rather
+ * than throwing the sampler over.
+ */
+function recordedSymbols() {
+  const out = Object.values(UNDERLYINGS).map((c) => c.key);
+  for (const name of cfg.RECORDED_STOCKS) {
+    const c = resolveSymbol(name);
+    if (!c) { vlog(`Ignoring VEGA_RECORDED_STOCKS entry '${name}': no live chain`); continue; }
+    if (!out.includes(c.key)) out.push(c.key);
+  }
+  return out;
+}
+
+/**
+ * Every {symbol, expiry} to consider this tick, with why it is in the set.
+ * `watched` targets get the full 5s clock; the rest only compute when the tick
+ * lands on their persist resolution.
+ */
+function activeTargets() {
+  const targets = new Map();
+
+  const add = (symbol, expiry, patch) => {
+    const key = stateKey(symbol, expiry);
+    const existing = targets.get(key);
+    if (existing) Object.assign(existing, patch);
+    else targets.set(key, { symbol: String(symbol).toUpperCase(), expiry, watched: false, recorded: false, ...patch });
+  };
+
+  for (const symbol of recordedSymbols()) {
+    for (const expiry of trackedExpiries(symbol)) add(symbol, expiry, { recorded: true });
+  }
+  for (const { symbol, expiry } of demand.values()) {
+    if (expiry) add(symbol, expiry, { watched: true });
+  }
+
+  return [...targets.values()];
+}
+
+// ---------------------------------------------------------------------------
+// On-demand registry (Feature 8) — called by vegaStreamService
+// ---------------------------------------------------------------------------
+
+/**
+ * Register (or replace) one owner's live target.
+ *
+ * Returns whether anything changed, so the caller can avoid re-subscribing Kite
+ * tokens for a no-op — a client re-sending its current selection must not churn
+ * the ticker subscription.
+ */
+function registerDemand(ownerKey, { symbol, expiry }) {
+  const c = resolveSymbol(symbol);
+  if (!c) return { changed: false, symbol: null, expiry: null };
+
+  const chosen = expiryKey(expiry) || trackedExpiries(c.key)[0] || null;
+  const prev = demand.get(ownerKey);
+  const changed = !prev || prev.symbol !== c.key || prev.expiry !== chosen;
+
+  demand.set(ownerKey, { symbol: c.key, expiry: chosen });
+  return { changed, symbol: c.key, expiry: chosen };
+}
+
+function releaseDemand(ownerKey) {
+  return demand.delete(ownerKey);
+}
+
+function demandStats() {
+  const byTarget = new Map();
+  for (const { symbol, expiry } of demand.values()) {
+    const k = `${symbol}|${expiry}`;
+    byTarget.set(k, (byTarget.get(k) || 0) + 1);
+  }
+  return { owners: demand.size, targets: Object.fromEntries(byTarget) };
+}
+
+// ---------------------------------------------------------------------------
+// Baseline sanity
+// ---------------------------------------------------------------------------
 
 /**
  * Guard against freezing a day-open baseline whose Greeks are mostly null.
@@ -131,7 +268,7 @@ function memoryExpiries(symbol) {
  * becomes `current - 0 = current`, i.e. permanently positive and tracking
  * raw current vega instead of the actual change from the morning. Since the
  * baseline is immutable once captured, this is unrecoverable for the day —
- * so refuse to freeze it and let captureDayOpen retry on the next sample.
+ * so refuse to freeze it and let captureDayOpen retry on the next tick.
  */
 function isUsableOpenChain(chain, minFraction = 0.5) {
   if (!chain.length) return false;
@@ -171,7 +308,7 @@ function fmtSql(d) { return d.toISOString().slice(0, 19).replace('T', ' '); }
 function parseJson(v) { try { return typeof v === 'string' ? JSON.parse(v) : (v || []); } catch { return []; } }
 
 // ---------------------------------------------------------------------------
-// Standing Kite subscription for the sampler
+// Standing Kite subscription
 // ---------------------------------------------------------------------------
 
 const STANDING_KEY = 'vega-sampler';
@@ -184,14 +321,12 @@ const STANDING_KEY = 'vega-sampler';
  * live clients had selected, so a headless server recorded nothing at all —
  * empty ticks -> null Greeks -> day-open rejected -> zero rows for the day.
  *
- * EXPIRY-WISE: the union now covers every tracked expiry, not just the front
- * one, because a series that is never subscribed can never be calculated. This
- * is still ONE standing set under ONE key, so it is still one reconcile and one
- * `updateSubscription` call — switching expiry in the UI subscribes nothing new
- * and unsubscribes nothing, which is what keeps the ticker connection stable.
- *
- * Re-registers on every tick (cheap; setStandingTokens no-ops when unchanged),
- * which also means an expiry rollover is picked up automatically.
+ * ONE standing set, covering every active target (recorded + on demand). Because
+ * it is a single named set, replacing it is one reconcile and one
+ * updateSubscription call, and tokens that dropped out of the set are released
+ * in the same breath — a client switching from NIFTY to APLAPOLLO does not
+ * accumulate both. setStandingTokens no-ops when the union is unchanged, so
+ * calling this every tick is cheap and an expiry rollover is picked up for free.
  */
 function ensureSubscriptions() {
   if (!instrumentService.isReady()) return null;
@@ -199,31 +334,28 @@ function ensureSubscriptions() {
   const tokens = [];
   const detail = [];
 
-  for (const c of Object.values(UNDERLYINGS)) {
-    const expiries = trackedExpiries(c.key);
-    if (!expiries.length) continue;
+  // Index spot tokens are always in the union via SUBSCRIBED_TOKENS, but a
+  // stock's spot has to be added explicitly or its chain has no underlying.
+  for (const target of activeTargets()) {
+    const c = resolveSymbol(target.symbol);
+    if (!c) continue;
 
-    const spot = latestTicksRef?.get(c.spotToken)?.lastPrice ?? null;
+    const spot = c.spotToken != null ? latestTicksRef?.get(c.spotToken)?.lastPrice ?? null : null;
+    const sel = instrumentService.getTokensForExpiry(c.key, target.expiry, {
+      spot,
+      strikeWindow: cfg.STRIKE_WINDOW,
+    });
 
-    let count = 0;
-    for (const expiry of expiries) {
-      const sel = instrumentService.getTokensForExpiry(c.key, expiry, {
-        spot,
-        strikeWindow: cfg.STRIKE_WINDOW,
-      });
-      tokens.push(...sel.tokens);
-      count += sel.tokens.length;
-    }
-
-    tokens.push(c.spotToken);
-    detail.push(`${c.key}:${count}/${expiries.length}exp`);
+    tokens.push(...sel.tokens);
+    if (c.spotToken != null) tokens.push(c.spotToken);
+    detail.push(`${c.key}/${target.expiry}:${sel.tokens.length}`);
   }
 
   if (!tokens.length) return null;
 
   const result = subscriptionManager.setStandingTokens(STANDING_KEY, tokens);
   if (result.changed) {
-    vlog(`Subscribed ${result.count} tokens for recording (${detail.join(' ')})`, true);
+    vlog(`Subscribed ${result.count} tokens across ${detail.length} targets`, true);
   }
   return result;
 }
@@ -233,14 +365,14 @@ function ensureSubscriptions() {
 // ---------------------------------------------------------------------------
 
 function buildChainFor(symbol, expiry) {
-  const c = getUnderlying(symbol);
+  const c = resolveSymbol(symbol);
   if (!c) { vlog(`Skipped ${symbol}: unknown underlying`); return null; }
   if (!instrumentService.isReady()) { vlog(`Skipped ${symbol}: instrument master not ready`); return null; }
 
   const chosen = expiryKey(expiry);
   if (!chosen) { vlog(`Skipped ${c.key}: no expiry available`); return null; }
 
-  const spotTick = latestTicksRef?.get(c.spotToken);
+  const spotTick = c.spotToken != null ? latestTicksRef?.get(c.spotToken) : null;
   if (spotTick?.lastPrice == null) { vlog(`Skipped ${c.key}: no live spot tick (feed idle?)`); return null; }
 
   try {
@@ -250,7 +382,7 @@ function buildChainFor(symbol, expiry) {
       latestTicks: latestTicksRef,
       strikeWindow: cfg.STRIKE_WINDOW,
     });
-    return { snap, expiry: chosen, price: spotTick.lastPrice };
+    return { snap, expiry: chosen, price: spotTick.lastPrice, atmStrike: snap.atmStrike ?? null };
   } catch {
     return null;
   }
@@ -261,7 +393,7 @@ function buildChainFor(symbol, expiry) {
 // ---------------------------------------------------------------------------
 
 async function captureDayOpen(symbol, expiry) {
-  const c = getUnderlying(symbol);
+  const c = resolveSymbol(symbol);
   if (!c) return null;
 
   const chosen = expiryKey(expiry) || trackedExpiries(c.key)[0];
@@ -279,7 +411,7 @@ async function captureDayOpen(symbol, expiry) {
   if (!openChain.length) return null;
 
   if (!isUsableOpenChain(openChain)) {
-    vlog(`Rejected day-open for ${c.key} ${chosen}: Greeks mostly null (stale ticks?) — retrying next minute`, true);
+    vlog(`Rejected day-open for ${c.key} ${chosen}: Greeks mostly null (stale ticks?) — retrying next tick`, true);
     return null;
   }
 
@@ -308,10 +440,10 @@ async function captureDayOpen(symbol, expiry) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-minute sample (PHP: the vega_chart INSERT) — per expiry
+// One sample (PHP: the vega_chart INSERT) — per {symbol, expiry}
 // ---------------------------------------------------------------------------
 
-function computeDiffs(symbol, expiry) {
+function computeDiffs(symbol, expiry, at = new Date()) {
   const chosen = expiryKey(expiry);
   const entry = state.get(stateKey(symbol, chosen));
   if (!entry?.open) { vlog(`Skipped ${symbol} ${chosen}: no day-open baseline yet`); return null; }
@@ -322,9 +454,10 @@ function computeDiffs(symbol, expiry) {
   const start = startFor(symbol);
   const currentChain = toGreekChain(built.snap.chain);
 
-  // THE PARITY CHANGE: dynamic strike set recomputed from the CURRENT chain,
-  // then looked up in the day-open chain (addvega.php). 'frozen' reuses the
-  // 09:16 lists instead.
+  // DYNAMIC: the strike set is recomputed from the CURRENT chain each call, then
+  // looked up in the day-open chain (addvega.php). 'frozen' reuses the 09:16
+  // lists instead. Identical for indices and stocks — nothing here branches on
+  // instrument class.
   const point = computePoint({
     currentChain,
     openChain: entry.open.chain,
@@ -335,7 +468,7 @@ function computeDiffs(symbol, expiry) {
   });
 
   return {
-    time: Math.floor(Date.now() / 1000),
+    time: Math.floor(at.getTime() / 1000),
     callVegaDiff: point.callVegaDiff,
     putVegaDiff: point.putVegaDiff,
     vegaDiff: point.vegaDiff,
@@ -344,6 +477,7 @@ function computeDiffs(symbol, expiry) {
     openCallVega: point.openCallVega,
     openPutVega: point.openPutVega,
     price: built.price,
+    atmStrike: built.atmStrike,
     callStrikeCount: point.callStrikeCount,
     putStrikeCount: point.putStrikeCount,
     expiry: built.expiry,
@@ -351,54 +485,89 @@ function computeDiffs(symbol, expiry) {
   };
 }
 
-async function sampleAll() {
+/** Push into the bounded live buffer, replacing a same-second duplicate. */
+function appendLive(key, entry, point) {
+  const last = entry.series[entry.series.length - 1];
+  if (last && last.time === point.time) entry.series[entry.series.length - 1] = point;
+  else entry.series.push(point);
+
+  // Bounded — an unbounded array per instrument is how a recorder that runs all
+  // day becomes a memory leak.
+  const overflow = entry.series.length - cfg.LIVE_BUFFER_POINTS;
+  if (overflow > 0) entry.series.splice(0, overflow);
+
+  state.set(key, entry);
+}
+
+/**
+ * Listeners notified after each sampler tick, with the targets that produced a
+ * fresh point. vegaStreamService uses this to push to browsers instead of
+ * polling the state map on its own timer — one clock, one traversal.
+ */
+const tickListeners = new Set();
+function onTick(fn) { tickListeners.add(fn); return () => tickListeners.delete(fn); }
+
+async function sampleAll(now = new Date()) {
   // Subscribe BEFORE the window check, not after.
   //
   // The cron fires from 09:00 while the sampling window opens at 09:15, so
   // those first ticks give Kite ~15 minutes to start streaming the option
   // contracts. Doing it after the early-return would mean subscribing at
   // 09:15:00 and reading the cache in the same breath — empty, so the 09:15
-  // day-open would always be rejected and the baseline would slip a minute.
+  // day-open would always be rejected and the baseline would slip a tick.
   ensureSubscriptions();
 
-  if (!isSamplingWindow()) { vlog('Skipped: market closed (outside window or weekend)'); return; }
+  if (!isSamplingWindow(now)) { vlog('Skipped: market closed (outside window or weekend)'); return; }
 
+  const epoch = Math.floor(now.getTime() / 1000);
   const written = [];
   const rawSnaps = [];
+  const updated = [];
 
-  for (const c of Object.values(UNDERLYINGS)) {
-    for (const expiry of trackedExpiries(c.key)) {
-      const key = stateKey(c.key, expiry);
-      if (!state.get(key)?.open) await captureDayOpen(c.key, expiry);
+  for (const target of activeTargets()) {
+    const resolution = persistResolutionFor(target.symbol);
+    const persistNow = epoch % tfSeconds(resolution) === 0;
 
-      const point = computeDiffs(c.key, expiry);
-      if (!point) continue;
+    // The whole point of the 5s clock being cheap: a recorded stock that nobody
+    // is watching does one chain build a minute, not twelve.
+    if (!target.watched && !persistNow) continue;
 
-      const chain = point._chain;
-      delete point._chain;
+    const key = stateKey(target.symbol, target.expiry);
+    if (!state.get(key)?.open) await captureDayOpen(target.symbol, target.expiry);
 
-      const entry = state.get(key);
-      entry.series.push(point);
-      state.set(key, entry);
-      written.push({ symbol: c.key, ...point });
-      if (chain) rawSnaps.push({ symbol: c.key, expiry: point.expiry, sampledAt: new Date(point.time * 1000), chain });
+    const point = computeDiffs(target.symbol, target.expiry, now);
+    if (!point) continue;
+
+    const chain = point._chain;
+    delete point._chain;
+
+    const entry = state.get(key);
+    appendLive(key, entry, point);
+    updated.push({ symbol: target.symbol, expiry: target.expiry, point });
+
+    if (persistNow) {
+      written.push({ symbol: target.symbol, resolution, ...point });
+      if (chain) rawSnaps.push({ symbol: target.symbol, expiry: point.expiry, sampledAt: new Date(point.time * 1000), chain });
     }
   }
 
   if (written.length) {
     try {
       await persistSamples(written);
-      vlog(`Inserted ${written.length} row(s): ${written.map((w) => `${w.symbol}/${w.expiry}`).join(', ')}`, true);
+      vlog(`Inserted ${written.length} row(s)`, false);
     } catch (err) {
       vlog(`Skipped: INSERT failed - ${err.message}`, true);
     }
-    // Optional raw-chain archive (no-op unless VEGA_STORE_RAW_CHAINS=true).
     const today = istParts().date;
     for (const s of rawSnaps) {
       await chainSnapshotStore.persist({ date: today, symbol: s.symbol, sampledAt: s.sampledAt, expiry: s.expiry, chain: s.chain });
     }
-  } else {
-    vlog('Skipped: no symbol/expiry produced a point this minute');
+  }
+
+  if (updated.length) {
+    for (const fn of tickListeners) {
+      try { fn(updated); } catch (err) { console.warn('[VegaSeries] tick listener failed:', err.message); }
+    }
   }
 }
 
@@ -426,20 +595,21 @@ async function persistSamples(points) {
   const today = istParts().date;
   await db.query(
     `INSERT INTO vega_timeseries
-       (snapshot_date, symbol, sampled_at, expiry,
+       (snapshot_date, symbol, sampled_at, expiry, resolution, atm_strike,
         call_vega_diff, put_vega_diff, vega_diff,
         current_call_vega, current_put_vega,
         open_call_vega, open_put_vega,
         price, call_strike_count, put_strike_count)
      VALUES ?
      ON DUPLICATE KEY UPDATE
+       atm_strike=VALUES(atm_strike),
        call_vega_diff=VALUES(call_vega_diff), put_vega_diff=VALUES(put_vega_diff),
        vega_diff=VALUES(vega_diff), current_call_vega=VALUES(current_call_vega),
        current_put_vega=VALUES(current_put_vega), open_call_vega=VALUES(open_call_vega),
        open_put_vega=VALUES(open_put_vega), price=VALUES(price),
        call_strike_count=VALUES(call_strike_count), put_strike_count=VALUES(put_strike_count)`,
     [points.map((p) => [
-      today, p.symbol, fmtSql(new Date(p.time * 1000)), p.expiry,
+      today, p.symbol, fmtSql(new Date(p.time * 1000)), p.expiry, p.resolution, p.atmStrike,
       p.callVegaDiff, p.putVegaDiff, p.vegaDiff,
       p.currentCallVega, p.currentPutVega,
       p.openCallVega, p.openPutVega,
@@ -448,6 +618,15 @@ async function persistSamples(points) {
   );
 }
 
+/**
+ * Restore today's baselines and series after a restart.
+ *
+ * Only the newest LIVE_BUFFER_POINTS per series are kept in memory — a full day
+ * of 5s index rows across three expiries is tens of thousands of rows, and the
+ * live buffer exists to answer "what happened recently", not to be a second
+ * copy of the database. Anything older is still on disk and still served by the
+ * historical read path.
+ */
 async function loadToday() {
   try {
     const today = istParts().date;
@@ -484,8 +663,14 @@ async function loadToday() {
       state.set(key, entry);
     }
 
+    for (const [key, entry] of state) {
+      const overflow = entry.series.length - cfg.LIVE_BUFFER_POINTS;
+      if (overflow > 0) entry.series.splice(0, overflow);
+      state.set(key, entry);
+    }
+
     const total = [...state.values()].reduce((a, e) => a + e.series.length, 0);
-    console.log(`[VegaSeries] Restored ${opens.length} baselines, ${total} samples ` +
+    console.log(`[VegaSeries] Restored ${opens.length} baselines, ${total} buffered samples ` +
       `across ${state.size} symbol/expiry series for today`);
   } catch (err) {
     console.warn('[VegaSeries] Could not restore today:', err.message);
@@ -513,13 +698,14 @@ function rowToPoint(r) {
     openCallVega: r.open_call_vega != null ? +r.open_call_vega : null,
     openPutVega: r.open_put_vega != null ? +r.open_put_vega : null,
     price: r.price != null ? +r.price : null,
+    atmStrike: r.atm_strike != null ? +r.atm_strike : null,
     callStrikeCount: r.call_strike_count,
     putStrikeCount: r.put_strike_count,
     expiry: expiryKey(r.expiry),
   };
 }
 
-/** Day-open reference for the latest point (dynamic => it moves each minute). */
+/** Day-open reference for the latest point (dynamic => it moves each sample). */
 function dayOpenSummaryFromPoints(points) {
   if (!points.length) return null;
   const last = points[points.length - 1];
@@ -531,17 +717,73 @@ function dayOpenSummaryFromPoints(points) {
   };
 }
 
-/** The stored per-minute rows for one calendar day + expiry, bucketed + trend-decorated. */
-async function readStoredPoints(symbol, date, timeframe = '1m', expiry = null) {
+/**
+ * Last value wins inside each bucket.
+ *
+ * This is the same rule the live push uses (vegaStreamService emits the bucket's
+ * current value at the bucket's start time), which is what keeps a chart that
+ * has been open all session identical to the same chart reloaded from history.
+ */
+function bucketByTimeframe(points, timeframe = '1m') {
+  const seconds = tfSeconds(timeframe) || 60;
+  if (points.length < 2) return points;
+  const out = [];
+  let bucket = null;
+  let last = null;
+  for (const p of points) {
+    const b = Math.floor(p.time / seconds) * seconds;
+    if (bucket !== null && b !== bucket) out.push({ ...last, time: bucket });
+    bucket = b;
+    last = p;
+  }
+  if (last) out.push({ ...last, time: bucket });
+  return out;
+}
+
+/** Which stored resolutions exist for one {symbol, date, expiry}. */
+async function storedResolutions(symbol, date, expiry = null) {
+  const [rows] = await db.query(
+    `SELECT DISTINCT resolution FROM vega_timeseries
+      WHERE symbol = :symbol AND snapshot_date = :date
+        AND (:expiry IS NULL OR expiry = :expiry)`,
+    { symbol: String(symbol).toUpperCase(), date, expiry: expiryKey(expiry) || null }
+  );
+  return rows.map((r) => r.resolution).filter(Boolean);
+}
+
+/**
+ * The finest stored resolution that can build the requested timeframe, or null
+ * when none can — which is a real answer, not an error: a stock recorded at 1m
+ * genuinely cannot produce a 15s bar, and the caller must say so rather than
+ * render an empty chart with no explanation.
+ */
+function pickResolution(available, timeframe) {
+  const usable = available.filter((r) => canServe(r, timeframe));
+  if (!usable.length) return null;
+  return usable.sort((a, b) => tfSeconds(a) - tfSeconds(b))[0];
+}
+
+/** Timeframes a given set of stored resolutions can serve, coarsest resolution wins. */
+function servableTimeframes(available) {
+  return Object.keys(cfg.TIMEFRAMES).filter((tf) => available.some((r) => canServe(r, tf)));
+}
+
+/** The stored rows for one day / expiry / resolution, bucketed + trend-decorated. */
+async function readStoredPoints(symbol, date, timeframe = '1m', expiry = null, resolution = null) {
   const [rows] = await db.query(
     `SELECT sampled_at, call_vega_diff, put_vega_diff, vega_diff,
             current_call_vega, current_put_vega, open_call_vega, open_put_vega,
-            price, call_strike_count, put_strike_count, expiry
+            price, atm_strike, call_strike_count, put_strike_count, expiry
        FROM vega_timeseries
       WHERE symbol = :symbol AND snapshot_date = :date
         AND (:expiry IS NULL OR expiry = :expiry)
+        AND (:resolution IS NULL OR resolution = :resolution)
       ORDER BY sampled_at ASC`,
-    { symbol, date, expiry: expiry || null }
+    {
+      symbol: String(symbol).toUpperCase(), date,
+      expiry: expiryKey(expiry) || null,
+      resolution: resolution || null,
+    }
   );
   return bucketByTimeframe(rows.map(rowToPoint), timeframe).map(decorate);
 }
@@ -549,10 +791,9 @@ async function readStoredPoints(symbol, date, timeframe = '1m', expiry = null) {
 /**
  * Baseline metadata for a past day + expiry.
  *
- * The per-minute rows carry the (moving) day-open totals, but only
- * vega_day_open knows WHEN the baseline was frozen. The chain column is
- * deliberately not selected — it is a large JSON blob and nothing on the read
- * path needs it.
+ * The per-sample rows carry the (moving) day-open totals, but only vega_day_open
+ * knows WHEN the baseline was frozen. The chain column is deliberately not
+ * selected — it is a large JSON blob and nothing on the read path needs it.
  */
 async function loadDayOpenMeta(symbol, date, expiry = null) {
   try {
@@ -563,7 +804,7 @@ async function loadDayOpenMeta(symbol, date, expiry = null) {
           AND (:expiry IS NULL OR expiry = :expiry)
         ORDER BY expiry ASC
         LIMIT 1`,
-      { symbol, date, expiry: expiry || null }
+      { symbol: String(symbol).toUpperCase(), date, expiry: expiryKey(expiry) || null }
     );
     if (!rows.length) return null;
     return { expiry: expiryKey(rows[0].expiry), capturedAt: rows[0].captured_at || null };
@@ -584,16 +825,15 @@ async function loadDayOpenMeta(symbol, date, expiry = null) {
  *   stored   — expiries that actually have rows for that day. The ONLY source
  *              for a past session; a contract that has since expired is gone
  *              from the instrument master but its recorded day is still real.
- *   tracked  — the contracts the recorder is sampling right now. Needed for
- *              TODAY so a freshly-rolled expiry is selectable before its first
- *              sample lands, instead of appearing an hour into the session.
+ *   tracked  — the contracts being sampled right now. Needed for TODAY so a
+ *              freshly-rolled expiry, or one a user has only just selected, is
+ *              offered before its first sample lands.
  *
  * Nearest expiry first, which is the order a trader reads them in.
  */
 async function listExpiries(symbol, date) {
   const key = String(symbol || '').toUpperCase();
-  const today = istParts().date;
-  const isToday = date === today;
+  const isToday = date === istParts().date;
 
   const [rows] = await db.query(
     `SELECT expiry,
@@ -612,11 +852,8 @@ async function listExpiries(symbol, date) {
     const e = expiryKey(r.expiry);
     if (!e) continue;
     byExpiry.set(e, {
-      expiry: e,
-      points: Number(r.points),
-      firstAt: toUnix(r.first_at),
-      lastAt: toUnix(r.last_at),
-      recording: false,
+      expiry: e, points: Number(r.points),
+      firstAt: toUnix(r.first_at), lastAt: toUnix(r.last_at), recording: false,
     });
   }
 
@@ -627,8 +864,7 @@ async function listExpiries(symbol, date) {
       const existing = byExpiry.get(entry.expiry);
       if (!existing || entry.series.length > existing.points) {
         byExpiry.set(entry.expiry, {
-          expiry: entry.expiry,
-          points: entry.series.length,
+          expiry: entry.expiry, points: entry.series.length,
           firstAt: entry.series[0].time,
           lastAt: entry.series[entry.series.length - 1].time,
           recording: false,
@@ -651,8 +887,8 @@ async function listExpiries(symbol, date) {
  *
  * An unknown/absent request resolves to the NEAREST expiry available for that
  * day rather than 404-ing, so a bookmarked URL, an expiry that rolled over
- * between page loads, or a client that simply has not asked yet all land on
- * the front-month series instead of an error.
+ * between page loads, or a client that simply has not asked yet all land on the
+ * front-month series instead of an error.
  */
 async function resolveExpiry(symbol, date, requested) {
   const wanted = expiryKey(requested);
@@ -665,26 +901,46 @@ async function resolveExpiry(symbol, date, requested) {
 }
 
 /**
- * Read one trading day for one expiry — the single entry point behind the date
- * and expiry pickers.
+ * Read one trading day, for one expiry, at one timeframe — the single entry
+ * point behind the instrument, expiry, timeframe and date pickers.
  *
- * Today comes from the in-memory series (it is still being appended to), any
+ * Today comes from the in-memory buffer (it is still being appended to), any
  * other day from MySQL. The one subtlety: today ALSO falls back to MySQL when
  * memory is empty. That happens after a restart before loadToday() finishes,
  * and it is the difference between the user seeing the morning's curve and
  * seeing a blank chart on a day that has rows on disk.
+ *
+ * `unavailable` is set — with the timeframes that WOULD work — when the day has
+ * data but none of it is fine enough for the requested timeframe. That is the
+ * "5s history for a stock" case, and it has to be distinguishable from "nothing
+ * was recorded", because the fix is different.
  */
 async function loadByDate(symbol, date, timeframe = '1m', expiry = null) {
   const key = String(symbol || '').toUpperCase();
   const live = date === istParts().date;
   const chosen = expiryKey(expiry);
 
-  let points = live ? getSeries(key, timeframe, chosen) : [];
+  const available = await storedResolutions(key, date, chosen);
+  const resolution = pickResolution(available, timeframe);
+
+  let points = [];
   let fromStore = false;
+  let unavailable = null;
+
+  // The live buffer is at the 5s base clock, so it can serve any timeframe.
+  if (live) points = getSeries(key, timeframe, chosen);
 
   if (!points.length) {
-    points = await readStoredPoints(key, date, timeframe, chosen);
-    fromStore = points.length > 0;
+    if (available.length && !resolution) {
+      unavailable = {
+        reason: 'resolution',
+        storedResolutions: available,
+        servableTimeframes: servableTimeframes(available),
+      };
+    } else {
+      points = await readStoredPoints(key, date, timeframe, chosen, resolution);
+      fromStore = points.length > 0;
+    }
   }
 
   const meta = await loadDayOpenMeta(key, date, chosen);
@@ -699,8 +955,10 @@ async function loadByDate(symbol, date, timeframe = '1m', expiry = null) {
     dayOpen,
     live,
     expiry: chosen,
-    // A baseline exists if it is frozen in memory for today, persisted for the
-    // day, or implied by rows that were computed against one.
+    timeframe,
+    resolution: resolution || (live && points.length ? cfg.PERSIST_RESOLUTION.index : null),
+    storedResolutions: available,
+    unavailable,
     hasBaseline: !!(meta || summary || (live && chosen && state.get(stateKey(key, chosen))?.open)),
     fromStore,
   };
@@ -709,27 +967,24 @@ async function loadByDate(symbol, date, timeframe = '1m', expiry = null) {
 /**
  * Read a DELAYED window of the series, for the public marketing site.
  *
- * This is the only vega read that is served without authentication, so it is
- * deliberately a separate function rather than a flag on loadByDate() — there
- * is no argument anyone can pass to the premium path that turns it into this
- * one, and no way to accidentally drop the delay by forgetting a parameter.
+ * This is the only vega read served without authentication, so it is
+ * deliberately a separate function rather than a flag on loadByDate() — there is
+ * no argument anyone can pass to the premium path that turns it into this one,
+ * and no way to accidentally drop the delay by forgetting a parameter.
  *
- * EXPIRY: the public teaser shows ONE series, and it is always the nearest
- * expiry that has publishable rows. Picking it inside this function (rather
- * than accepting it as a parameter) keeps the public surface exactly as wide
- * as it was before expiries existed.
+ * It stays pinned to NIFTY-style index behaviour: the nearest expiry with
+ * publishable rows, at 1m. The public teaser gained no new axes when the
+ * terminal did — no instrument picker, no seconds, no expiry parameter — so the
+ * public surface is exactly as wide as it was.
  *
  * TIMEZONE NOTE, because getting this wrong silently serves live data:
  * `sampled_at` is written in UTC (persistSamples -> fmtSql -> toISOString),
  * while `snapshot_date` is the IST trading day. The cutoff below is therefore
- * built in UTC to match the column it is compared against. Comparing against
- * an IST cutoff would shift the window by 5h30m and expose the live tail.
+ * built in UTC to match the column it is compared against.
  *
- * FALLBACK: before ~09:45 IST on a trading day — and all weekend — today has
- * no points old enough to publish. Rather than serve an empty chart, fall back
- * to the most recent COMPLETED session and say so via `isFallbackDay`, which
- * the caller must surface so the visitor is never misled about what they are
- * looking at. A past day is finished, so no cutoff applies to it.
+ * FALLBACK: before ~09:45 IST on a trading day — and all weekend — today has no
+ * points old enough to publish, so this falls back to the most recent COMPLETED
+ * session and says so via `isFallbackDay`, which the caller must surface.
  */
 const PUBLIC_DELAY_MINUTES = 30;
 
@@ -739,7 +994,6 @@ async function loadDelayed(symbol, { delayMinutes = PUBLIC_DELAY_MINUTES, timefr
   const today = istParts().date;
   const cutoff = fmtSql(new Date(Date.now() - minutes * 60_000));
 
-  // Nearest expiry with rows old enough to publish.
   const [[front]] = await db.query(
     `SELECT MIN(expiry) AS e FROM vega_timeseries
       WHERE symbol = :symbol AND snapshot_date = :date AND sampled_at <= :cutoff`,
@@ -751,7 +1005,7 @@ async function loadDelayed(symbol, { delayMinutes = PUBLIC_DELAY_MINUTES, timefr
     const [rows] = await db.query(
       `SELECT sampled_at, call_vega_diff, put_vega_diff, vega_diff,
               current_call_vega, current_put_vega, open_call_vega, open_put_vega,
-              price, call_strike_count, put_strike_count, expiry
+              price, atm_strike, call_strike_count, put_strike_count, expiry
          FROM vega_timeseries
         WHERE symbol = :symbol AND snapshot_date = :date
           AND expiry = :expiry AND sampled_at <= :cutoff
@@ -762,10 +1016,7 @@ async function loadDelayed(symbol, { delayMinutes = PUBLIC_DELAY_MINUTES, timefr
     if (rows.length) {
       const points = bucketByTimeframe(rows.map(rowToPoint), timeframe).map(decorate);
       return {
-        date: today,
-        expiry: frontExpiry,
-        points,
-        delayMinutes: minutes,
+        date: today, expiry: frontExpiry, points, delayMinutes: minutes,
         isFallbackDay: false,
         asOf: points.length ? points[points.length - 1].time : null,
       };
@@ -790,12 +1041,9 @@ async function loadDelayed(symbol, { delayMinutes = PUBLIC_DELAY_MINUTES, timefr
   );
   const fallbackExpiry = expiryKey(fallbackFront?.e);
 
-  const points = await readStoredPoints(key, fallbackDate, timeframe, fallbackExpiry);
+  const points = await readStoredPoints(key, fallbackDate, timeframe, fallbackExpiry, null);
   return {
-    date: fallbackDate,
-    expiry: fallbackExpiry,
-    points,
-    delayMinutes: minutes,
+    date: fallbackDate, expiry: fallbackExpiry, points, delayMinutes: minutes,
     isFallbackDay: true,
     asOf: points.length ? points[points.length - 1].time : null,
   };
@@ -803,12 +1051,11 @@ async function loadDelayed(symbol, { delayMinutes = PUBLIC_DELAY_MINUTES, timefr
 
 /**
  * Days that actually have stored samples, newest first — this drives the date
- * picker, so it also reports the session's first/last sample so the UI can
- * label each day with its real recording window rather than assuming 09:15.
+ * picker, so it also reports the session's first/last sample so the UI can label
+ * each day with its real recording window rather than assuming 09:15.
  *
  * `expiry` narrows the list to days on which THAT contract was recorded, which
- * is what the date arrows need once an expiry is selected — otherwise stepping
- * back a day can land on a session that has no rows for the chosen expiry.
+ * is what the date arrows need once an expiry is selected.
  */
 async function listAvailableDates(symbol, limit = 120, expiry = null) {
   const key = String(symbol || '').toUpperCase();
@@ -842,29 +1089,10 @@ function toUnix(v) {
   return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
 }
 
-const TIMEFRAME_MINUTES = { '1m': 1, '3m': 3, '5m': 5, '15m': 15 };
-
-function bucketByTimeframe(points, timeframe = '1m') {
-  const minutes = TIMEFRAME_MINUTES[timeframe] || 1;
-  if (minutes === 1 || points.length < 2) return points;
-  const bucketSeconds = minutes * 60;
-  const out = [];
-  let bucket = null, last = null;
-  for (const p of points) {
-    const b = Math.floor(p.time / bucketSeconds) * bucketSeconds;
-    if (bucket !== null && b !== bucket) out.push({ ...last, time: bucket });
-    bucket = b; last = p;
-  }
-  if (last) out.push({ ...last, time: bucket });
-  return out;
-}
-
 /**
- * The nearest expiry that TODAY's in-memory state can serve.
- *
- * Prefers an expiry that already has samples; falls back to the nearest tracked
- * contract so a caller that asks before the first sample still gets a stable
- * answer instead of null.
+ * The nearest expiry TODAY's in-memory state can serve. Prefers an expiry that
+ * already has samples; falls back to the nearest tracked contract so a caller
+ * that asks before the first sample still gets a stable answer.
  */
 function defaultLiveExpiry(symbol) {
   const key = String(symbol || '').toUpperCase();
@@ -897,27 +1125,25 @@ function getStats() {
     sampling: sampleTask !== null,
     window: isSamplingWindow(),
     instrumentsReady: instrumentService.isReady(),
-    // What the recorder actually has subscribed. If this is 0 during market
-    // hours, no rows will be written — that is the first thing to check.
     subscription: subscriptionManager.getStats(),
     filterMode: 'abs',
     strikeMode: cfg.STRIKE_MODE,
     deltaMax: cfg.DELTA_MAX,
     strikeWindow: cfg.STRIKE_WINDOW,
     expiryCount: cfg.EXPIRY_COUNT,
+    sampleCron: cfg.SAMPLE_CRON,
+    persistResolution: cfg.PERSIST_RESOLUTION,
+    recordedStocks: cfg.RECORDED_STOCKS,
+    liveBufferPoints: cfg.LIVE_BUFFER_POINTS,
     marketWindow: { openMin: cfg.MARKET_OPEN_MIN, closeMin: cfg.MARKET_CLOSE_MIN },
     storeRawChains: cfg.STORE_RAW_CHAINS,
-    // One entry per {symbol, expiry} series the recorder is holding.
+    demand: demandStats(),
     underlyings: [...state.values()].map((e) => ({
-      symbol: e.symbol,
-      expiry: e.expiry,
-      hasBaseline: !!e.open,
-      points: e.series.length,
+      symbol: e.symbol, expiry: e.expiry,
+      hasBaseline: !!e.open, points: e.series.length,
+      resolution: persistResolutionFor(e.symbol),
       start: startFor(e.symbol),
     })),
-    tracked: Object.fromEntries(
-      Object.values(UNDERLYINGS).map((c) => [c.key, trackedExpiries(c.key)])
-    ),
   };
 }
 
@@ -936,7 +1162,9 @@ function start(latestTicks) {
   );
 
   console.log(`[VegaSeries] Recording scheduled '${cfg.SAMPLE_CRON}' (${cfg.STRIKE_MODE} strikes, ` +
-    `${cfg.EXPIRY_COUNT} expiries/underlying, ` +
+    `${cfg.EXPIRY_COUNT} expiries/underlying, indices@${cfg.PERSIST_RESOLUTION.index} ` +
+    `stocks@${cfg.PERSIST_RESOLUTION.stock}` +
+    `${cfg.RECORDED_STOCKS.length ? ` +${cfg.RECORDED_STOCKS.length} recorded stock(s)` : ''}, ` +
     `records ${fmtMin(cfg.MARKET_OPEN_MIN)}-${fmtMin(cfg.MARKET_CLOSE_MIN)} ${cfg.TIMEZONE})`);
 
   sampleAll().catch((err) => console.error('[VegaSeries] Initial sample failed:', err.message));
@@ -957,6 +1185,9 @@ module.exports = {
   start, stop, loadToday, sampleAll, captureDayOpen, ensureSubscriptions,
   getSeries, getDayOpen, getLatest, getStats, loadByDate, listAvailableDates,
   listExpiries, resolveExpiry, trackedExpiries, defaultLiveExpiry,
+  registerDemand, releaseDemand, onTick,
+  resolveSymbol, isIndex, persistResolutionFor, canServe, servableTimeframes,
+  storedResolutions, bucketByTimeframe,
   loadDelayed, PUBLIC_DELAY_MINUTES,
-  TIMEFRAME_MINUTES, startFor, todayIst,
+  TIMEFRAMES: cfg.TIMEFRAMES, startFor, todayIst,
 };

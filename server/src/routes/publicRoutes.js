@@ -80,10 +80,10 @@ router.get('/vega/:symbol/delayed-series', async (req, res) => {
     if (!cfg) return res.status(404).json({ message: `Unknown symbol: ${req.params.symbol}` });
 
     const timeframe = String(req.query.timeframe || '1m');
-    if (!(timeframe in vegaTimeseriesService.TIMEFRAME_MINUTES)) {
+    if (!(timeframe in vegaTimeseriesService.TIMEFRAMES)) {
       return res.status(400).json({
         message: `Unsupported timeframe: ${timeframe}`,
-        supported: Object.keys(vegaTimeseriesService.TIMEFRAME_MINUTES),
+        supported: Object.keys(vegaTimeseriesService.TIMEFRAMES),
       });
     }
 

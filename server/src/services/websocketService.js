@@ -105,6 +105,22 @@ function initWebSocketServer(httpServer, getSnapshot) {
     });
 
     client.on('close', () => {
+      /**
+       * RELEASE THE CLIENT'S TOKENS.
+       *
+       * subscriptionManager.release() was documented as "call on disconnect,
+       * otherwise tokens leak and the 3,000 cap creeps up" — and nothing called
+       * it on disconnect. Only an explicit `unsubscribe_chain` released
+       * anything, so every browser that was simply closed left its option-chain
+       * tokens ref-counted forever, and the union grew until it hit Kite's
+       * per-connection limit and new subscriptions started failing.
+       *
+       * Both slots go, because a client can hold an option-chain selection and a
+       * vega selection at the same time (see vegaStreamService).
+       */
+      for (const fn of disconnectHandlers) {
+        try { fn(client); } catch (err) { console.warn('[WS] disconnect handler failed:', err.message); }
+      }
       console.log('[WS] Client disconnected —', wss.clients.size, 'total');
     });
 
@@ -134,6 +150,19 @@ function initWebSocketServer(httpServer, getSnapshot) {
  */
 let messageHandler = null;
 function setMessageHandler(fn) { messageHandler = fn; }
+
+/**
+ * Cleanup hooks run when a socket closes.
+ *
+ * A Set, and `onDisconnect` returns its own remover, so registering twice is
+ * impossible and a service that is stopped and restarted cannot leave a stale
+ * handler behind holding a reference to a dead client.
+ */
+const disconnectHandlers = new Set();
+function onDisconnect(fn) {
+  disconnectHandlers.add(fn);
+  return () => disconnectHandlers.delete(fn);
+}
 function handleClientMessage(client, msg) {
   if (typeof messageHandler === 'function') return messageHandler(client, msg);
   sendToClient(client, { type: 'error', message: `Unsupported message type: ${msg.type}` });
@@ -184,6 +213,7 @@ module.exports = {
   broadcastTicks,
   sendToClient,
   setMessageHandler,
+  onDisconnect,
   getWss,
   WS_PATH,
 };

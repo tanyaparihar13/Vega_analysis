@@ -45,6 +45,21 @@ const byToken = new Map();
 // tradingsymbol -> instrument row (options + futures + equity)
 const bySymbol = new Map();
 
+/**
+ * 'EXCHANGE:tradingsymbol' -> cash-segment row.
+ *
+ * bySymbol alone cannot answer "the NSE listing of APLAPOLLO", because ~10,000
+ * NSE and ~12,900 BSE equities share a keyspace and the last one indexed wins.
+ * The exchange loop ends with BSE, so every dual-listed name resolved to its BSE
+ * row — and the spot-token fill below, which requires the NSE row for an NFO
+ * underlying, silently failed for almost every F&O stock. They then all dropped
+ * out of listTradableUnderlyings(), which filters on `spotToken`.
+ *
+ * Symptom that hid the cause: getExpiries('APLAPOLLO') worked fine, so the name
+ * looked healthy everywhere except the one list that gates the UI.
+ */
+const cashByExchangeSymbol = new Map();
+
 // underlying key -> { expiries: Set<'YYYY-MM-DD'>, chains: Map<expiry, Map<strike, {CE, PE}>>, futures: Map<expiry, row> }
 const byUnderlying = new Map();
 
@@ -194,6 +209,7 @@ async function refresh(kc, opts = {}) {
 function buildIndexes(rows) {
   byToken.clear();
   bySymbol.clear();
+  cashByExchangeSymbol.clear();
   byUnderlying.clear();
   derivedUnderlyings.clear();
   const index = [];
@@ -226,6 +242,9 @@ function buildIndexes(rows) {
 
     byToken.set(token, row);
     bySymbol.set(row.tradingsymbol, row);
+    if (row.instrumentType === 'EQ') {
+      cashByExchangeSymbol.set(`${row.exchange}:${row.tradingsymbol}`, row);
+    }
 
     index.push({
       q: `${row.tradingsymbol} ${row.name || ''}`.toLowerCase(),
@@ -271,10 +290,16 @@ function buildIndexes(rows) {
 
   // Fill in the spot token for derived (equity) underlyings by matching the
   // cash-segment EQ listing on the same exchange family.
+  //
+  // Looked up by EXCHANGE:SYMBOL, not symbol alone — see cashByExchangeSymbol.
+  // A dual-listed name must resolve to the listing that matches its option
+  // segment (NFO -> NSE, BFO -> BSE), and the fallback covers a BFO underlying
+  // that only has an NSE cash listing, which is better than no spot at all.
   for (const [key, cfg] of derivedUnderlyings) {
-    const cashExchange = cfg.optionExchange === 'BFO' ? 'BSE' : 'NSE';
-    const cash = bySymbol.get(key);
-    if (cash && cash.instrumentType === 'EQ' && cash.exchange === cashExchange) {
+    const preferred = cfg.optionExchange === 'BFO' ? 'BSE' : 'NSE';
+    const cash = cashByExchangeSymbol.get(`${preferred}:${key}`)
+      || cashByExchangeSymbol.get(`${preferred === 'BSE' ? 'NSE' : 'BSE'}:${key}`);
+    if (cash) {
       cfg.spotToken = cash.instrumentToken;
       cfg.spotSymbol = cash.tradingsymbol;
       cfg.spotExchange = cash.exchange;

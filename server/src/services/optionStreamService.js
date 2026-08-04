@@ -1,8 +1,9 @@
-const { setMessageHandler, sendToClient, getWss } = require('./websocketService');
+const { setMessageHandler, sendToClient, getWss, onDisconnect } = require('./websocketService');
 const subscriptionManager = require('./subscriptionManager');
 const optionChainService = require('./optionChainService');
 const instrumentService = require('./instrumentService');
 const oiBaselineService = require('./oiBaselineService');
+const vegaStreamService = require('./vegaStreamService');
 const { getUnderlying } = require('../constants/instruments');
 
 /**
@@ -26,14 +27,29 @@ const PUSH_INTERVAL_MS = Number(process.env.CHAIN_PUSH_INTERVAL_MS || 1000);
 
 let pushTimer = null;
 let latestTicksRef = null;
+let unsubscribeDisconnect = null;
 
 function init(latestTicks) {
   latestTicksRef = latestTicks;
+  // ONE message handler for the socket. websocketService holds a single
+  // handler, so the two stream services are chained here rather than each
+  // calling setMessageHandler and silently overwriting the other.
   setMessageHandler(handleMessage);
+
+  // The chain's own tokens were never released on disconnect — see the note in
+  // websocketService's close handler. This is that release.
+  if (unsubscribeDisconnect) unsubscribeDisconnect();
+  unsubscribeDisconnect = onDisconnect((client) => subscriptionManager.release(client));
+
+  vegaStreamService.init();
   startPushLoop();
 }
 
 function handleMessage(client, msg) {
+  // Vega messages first; it returns false for anything it does not own, so the
+  // chain protocol below is completely unchanged.
+  if (vegaStreamService.handleMessage(client, msg)) return undefined;
+
   switch (msg?.type) {
     case 'subscribe_chain':
       return handleSubscribe(client, msg);
@@ -132,6 +148,8 @@ function startPushLoop() {
 function stop() {
   if (pushTimer) clearInterval(pushTimer);
   pushTimer = null;
+  if (unsubscribeDisconnect) { unsubscribeDisconnect(); unsubscribeDisconnect = null; }
+  vegaStreamService.stop();
 }
 
 module.exports = { init, stop, handleMessage };

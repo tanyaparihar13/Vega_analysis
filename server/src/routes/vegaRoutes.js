@@ -4,8 +4,18 @@ const express = require('express');
 const router = express.Router();
 const { authenticate, requirePremium } = require('../middleware/auth');
 const vegaTimeseriesService = require('../services/vegaTimeseriesService');
-const { getUnderlying } = require('../constants/instruments');
+const instrumentService = require('../services/instrumentService');
 const cfg = require('../config/vegaConfig');
+
+/**
+ * Resolve a path symbol to any tradable underlying — index OR F&O stock.
+ *
+ * Every route below used constants.getUnderlying, which knows five names, so a
+ * stock symbol 404'd before it reached the engine. resolveSymbol checks the
+ * curated indices first and falls back to the derived equity names from the
+ * instrument master, so index behaviour is unchanged and stocks now resolve.
+ */
+const getUnderlying = (symbol) => vegaTimeseriesService.resolveSymbol(symbol);
 
 /**
  * Vega Analysis time series (PHP addvega.php port).
@@ -46,10 +56,10 @@ router.get('/:symbol/series', authenticate, requirePremium, async (req, res) => 
     if (!cfgU) return res.status(404).json({ message: `Unknown symbol: ${req.params.symbol}` });
 
     const timeframe = String(req.query.timeframe || '1m');
-    if (!(timeframe in vegaTimeseriesService.TIMEFRAME_MINUTES)) {
+    if (!(timeframe in vegaTimeseriesService.TIMEFRAMES)) {
       return res.status(400).json({
         message: `Unsupported timeframe: ${timeframe}`,
-        supported: Object.keys(vegaTimeseriesService.TIMEFRAME_MINUTES),
+        supported: Object.keys(vegaTimeseriesService.TIMEFRAMES),
       });
     }
 
@@ -75,15 +85,26 @@ router.get('/:symbol/series', authenticate, requirePremium, async (req, res) => 
     const { expiry, available } =
       await vegaTimeseriesService.resolveExpiry(cfgU.key, resolvedDate, expiryParam.value);
 
-    const { points, dayOpen, live, hasBaseline, fromStore } =
+    const { points, dayOpen, live, hasBaseline, fromStore, resolution, storedResolutions, unavailable } =
       await vegaTimeseriesService.loadByDate(cfgU.key, resolvedDate, timeframe, expiry);
 
     const latest = points.length ? points[points.length - 1] : null;
 
     res.json({
       symbol: cfgU.key,
-      label: cfgU.label,
+      label: cfgU.label || cfgU.key,
+      isIndex: vegaTimeseriesService.isIndex(cfgU.key),
       timeframe,
+      // What the rows were RECORDED at, plus everything this day could serve —
+      // so the timeframe picker can grey out a tier instead of silently
+      // returning an empty chart for a 15s view of 1m stock history.
+      resolution,
+      storedResolutions,
+      supportedTimeframes: Object.keys(vegaTimeseriesService.TIMEFRAMES),
+      servableTimeframes: storedResolutions?.length
+        ? vegaTimeseriesService.servableTimeframes(storedResolutions)
+        : Object.keys(vegaTimeseriesService.TIMEFRAMES),
+      unavailable,
       date: resolvedDate,
       requestedDate: date,
       live,
@@ -175,6 +196,66 @@ router.get('/:symbol/dates', authenticate, requirePremium, async (req, res) => {
   } catch (err) {
     console.error('[vega/dates] error:', err.message);
     res.status(500).json({ message: 'Failed to list available dates' });
+  }
+});
+
+/**
+ * GET /api/vega/instruments?q=&limit=
+ *
+ * The searchable instrument catalogue behind the selector: the five curated
+ * indices, plus every F&O name the instrument master turned up that has a live
+ * chain and a resolved spot token.
+ *
+ * Grouped server-side because the grouping is a property of the data, not of the
+ * UI — `derived: false` is what makes something an index, and the client should
+ * not be re-deriving that from a hardcoded list of five names.
+ *
+ * `recorded` marks the instruments the headless sampler follows continuously.
+ * Anything else works fully in live mode but only has history from its first
+ * viewing, and the selector says so rather than letting a user discover it by
+ * finding an empty chart.
+ */
+router.get('/instruments', authenticate, requirePremium, (req, res) => {
+  try {
+    if (!instrumentService.isReady()) {
+      return res.status(503).json({
+        message: 'Instrument master not loaded yet. An admin must connect Zerodha.',
+        ready: false, indices: [], stocks: [],
+      });
+    }
+
+    const q = String(req.query.q || '').trim().toUpperCase();
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 500, 1000));
+    const recorded = new Set(cfg.RECORDED_STOCKS);
+
+    const all = instrumentService.listTradableUnderlyings().map((u) => ({
+      symbol: u.key,
+      label: u.label || u.key,
+      category: u.derived ? 'stock' : 'index',
+      exchange: u.optionExchange,
+      lotSize: u.lotSize || null,
+      strikeStep: u.strikeStep || null,
+      recorded: !u.derived || recorded.has(u.key),
+      resolution: vegaTimeseriesService.persistResolutionFor(u.key),
+    }));
+
+    const matched = q ? all.filter((i) => i.symbol.includes(q) || i.label.toUpperCase().includes(q)) : all;
+
+    const indices = matched.filter((i) => i.category === 'index');
+    const stocks = matched.filter((i) => i.category === 'stock').slice(0, limit);
+
+    res.json({
+      ready: true,
+      query: q || null,
+      // Indices are never truncated — there are five, and losing one to a limit
+      // meant for a 200-name stock list would be a bug nobody would notice.
+      counts: { indices: indices.length, stocks: stocks.length, stocksTotal: matched.length - indices.length },
+      indices,
+      stocks,
+    });
+  } catch (err) {
+    console.error('[vega/instruments] error:', err.message);
+    res.status(500).json({ message: 'Failed to list instruments' });
   }
 });
 

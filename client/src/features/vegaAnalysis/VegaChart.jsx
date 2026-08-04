@@ -68,11 +68,28 @@ function heightFor(viewportWidth, viewportHeight) {
  * inside the chart box, so it never hangs off the left edge of a phone-width
  * card or over the price axis on the right.
  */
-const TOOLTIP_WIDTH = 176;
-const TOOLTIP_HEIGHT = 116;
+const TOOLTIP_WIDTH = 208;
+const TOOLTIP_HEIGHT = 210;
 const TOOLTIP_GAP = 14;
 
-function VegaChart({ points, visible = {}, loading = false, emptyLabel, onHoverPoint }) {
+/** DD-MM-YYYY -> "28 Aug", which is how an expiry is said out loud. */
+const EXPIRY_LABEL = new Intl.DateTimeFormat('en-IN', {
+  day: 'numeric', month: 'short', timeZone: 'UTC',
+});
+const fmtExpiry = (iso) => {
+  if (!iso) return null;
+  const d = new Date(`${String(iso).slice(0, 10)}T00:00:00Z`);
+  return Number.isNaN(d.getTime()) ? String(iso).slice(0, 10) : EXPIRY_LABEL.format(d);
+};
+
+const fmtStrike = (v) => {
+  if (v == null || Number.isNaN(Number(v))) return null;
+  const n = Number(v);
+  // Index strikes are whole numbers; some stock boards list in 2.5s.
+  return Number.isInteger(n) ? n.toLocaleString('en-IN') : n.toFixed(2);
+};
+
+function VegaChart({ points, visible = {}, loading = false, emptyLabel, onHoverPoint, instrument }) {
   const wrapRef = useRef(null);
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -415,6 +432,12 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel, onHoverP
       {hover && hasPoints && (
         <ChartTooltip
           time={hover.time}
+          instrument={instrument}
+          // Per-point, not per-chart: a stored series can legitimately span an
+          // expiry rollover, and the tooltip should name the contract the point
+          // was actually computed against rather than whatever is selected now.
+          expiry={hoverPoint?.expiry}
+          strike={hoverPoint?.atmStrike}
           call={hover.call ?? hoverPoint?.callVegaDiff}
           put={hover.put ?? hoverPoint?.putVegaDiff}
           diff={hover.diff ?? hoverPoint?.vegaDiff}
@@ -468,7 +491,10 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel, onHoverP
  * `pointer-events-none` matters — a tooltip that can be hovered would steal
  * the crosshair from the chart underneath it and flicker.
  */
-function ChartTooltip({ time, call, put, diff, trend, trendColor, x, y, boxWidth, boxHeight }) {
+function ChartTooltip({
+  time, instrument, expiry, strike, call, put, diff, trend, trendColor,
+  x, y, boxWidth, boxHeight,
+}) {
   const width = boxWidth || 0;
   const height = boxHeight || 0;
 
@@ -478,6 +504,9 @@ function ChartTooltip({ time, call, put, diff, trend, trendColor, x, y, boxWidth
   const top = y - TOOLTIP_HEIGHT / 2;
 
   const clamp = (v, min, max) => Math.max(min, Math.min(v, max));
+
+  const expiryText = fmtExpiry(expiry);
+  const strikeText = fmtStrike(strike);
 
   return (
     <div
@@ -489,9 +518,15 @@ function ChartTooltip({ time, call, put, diff, trend, trendColor, x, y, boxWidth
         top: height ? clamp(top, 4, Math.max(4, height - TOOLTIP_HEIGHT - 4)) : top,
       }}
     >
-      <div className="flex items-baseline justify-between gap-2 border-b border-vega-border pb-1.5">
-        <span className="text-2xs font-bold uppercase tracking-wider text-ink-500">Time</span>
-        <span className="num text-xs font-bold text-ink-900">{fmtIst(time)}</span>
+      {/* Context block: what am I looking at. Rows that have no value are
+          omitted rather than shown as a dash — a stored day that predates the
+          atm_strike column has no strike to report, and an empty row is more
+          honest than "Strike –". */}
+      <div className="space-y-0.5 border-b border-vega-border pb-1.5">
+        <MetaRow label="Time" value={fmtIst(time)} strong />
+        {instrument && <MetaRow label="Instrument" value={instrument} strong />}
+        {expiryText && <MetaRow label="Expiry" value={expiryText} />}
+        {strikeText && <MetaRow label="Strike" value={strikeText} />}
       </div>
 
       <div className="mt-1.5 space-y-1">
@@ -508,6 +543,17 @@ function ChartTooltip({ time, call, put, diff, trend, trendColor, x, y, boxWidth
           </span>
         </div>
       )}
+    </div>
+  );
+}
+
+function MetaRow({ label, value, strong }) {
+  return (
+    <div className="flex items-baseline justify-between gap-2">
+      <span className="text-2xs font-bold uppercase tracking-wider text-ink-500">{label}</span>
+      <span className={`num truncate text-xs ${strong ? 'font-bold text-ink-900' : 'font-semibold text-ink-700'}`}>
+        {value}
+      </span>
     </div>
   );
 }
