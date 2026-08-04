@@ -178,14 +178,36 @@ export default function DelayedVegaPanel() {
           )}
         </div>
 
-        {/* ================= chart + unlock overlay ================= */}
-        <div className="relative px-2 pb-3 pt-3 sm:px-4 sm:pb-4">
-          <PublicVegaChart
-            points={points}
-            loading={loading}
-            emptyLabel={emptyLabel}
-            variant="hero"
-          />
+        {/* ================= chart + unlock card =================
+            SIDE BY SIDE, NOT OVERLAID.
+
+            The unlock card used to float over the chart (absolute, top-right)
+            on large screens. That was always a gamble: the card is ~330px wide
+            and ~250px tall, and where the Vega curve actually runs depends on
+            the day — a session that trends up puts the Call line straight
+            through the card, and on a rangebound day the dashed Difference
+            line disappears behind it. Nothing about "the emptiest part of the
+            chart" is true often enough to bet the product's most persuasive
+            surface on.
+
+            The chart and the card are now grid siblings, so the plot area is
+            whatever is left after the card, and the two can never intersect at
+            any width. The chart's own ResizeObserver picks up the narrower
+            column with no extra work.
+
+            Below `lg` this collapses to one column and the card sits under the
+            chart — which is what it already did, because a 330px card over a
+            340px-tall phone chart would have covered the very thing it is
+            advertising. */}
+        <div className="grid grid-cols-1 gap-4 px-2 pb-3 pt-3 sm:px-4 sm:pb-4 lg:grid-cols-[minmax(0,1fr)_20.5rem] lg:items-start lg:gap-5">
+          <div className="min-w-0">
+            <PublicVegaChart
+              points={points}
+              loading={loading}
+              emptyLabel={emptyLabel}
+              variant="hero"
+            />
+          </div>
 
           <UnlockCard to={liveTarget} signedIn={!!user} />
         </div>
@@ -259,10 +281,15 @@ function DelayBadge({ minutes }) {
 /**
  * "Unlock Live Vega Analysis".
  *
- * Floats over the top-right of the chart on large screens — where it overlaps
- * the emptiest part of a Vega curve — and drops to a normal block below the
- * chart under `lg`, because a 320px card floating over a 340px-tall phone chart
- * would cover the very thing it is advertising.
+ * Sits in its own column beside the chart on large screens and stacks under it
+ * below `lg`. It is deliberately NOT positioned over the plot any more — see
+ * the note on the grid above.
+ *
+ * The float animation is kept because it is part of the card's character, but
+ * it now runs on `float-sm` (a 6px travel instead of 12px) and only from `lg`.
+ * In a grid cell the card has neighbours: a 12px bob beside a static chart
+ * reads as drift rather than lift, and on a short viewport it would nudge the
+ * card's shadow into the panel's bottom rule.
  */
 function UnlockCard({ to, signedIn }) {
   return (
@@ -271,7 +298,7 @@ function UnlockCard({ to, signedIn }) {
       whileInView={{ opacity: 1, y: 0, scale: 1 }}
       viewport={{ once: true, amount: 0.4 }}
       transition={{ duration: 0.5, delay: 0.35, ease: [0.22, 1, 0.36, 1] }}
-      className="relative mx-1 mt-3 lg:absolute lg:right-8 lg:top-10 lg:z-20 lg:mx-0 lg:mt-0 lg:w-[330px] lg:animate-float"
+      className="relative mx-1 mt-3 w-auto lg:mx-0 lg:mt-2 lg:animate-float-sm"
     >
       <div className="rounded-2xl border border-primary/25 bg-[rgba(8,13,17,0.92)] p-5 shadow-glow backdrop-blur-2xl">
         <div className="flex items-center gap-2">

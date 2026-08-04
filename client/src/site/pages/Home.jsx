@@ -17,16 +17,21 @@ import { useAuth } from '../../context/AuthContext';
 /**
  * Public landing page.
  *
- * ELEVEN SECTIONS, IN ORDER: hero, the full-width Vega chart, the live market
- * strip, features, why Vega Analysis, the YouTube learning section, the
+ * ELEVEN SECTIONS, IN ORDER: the full-width Vega chart, the hero, the live
+ * market strip, features, why Vega Analysis, the YouTube learning section, the
  * analytics showcase, testimonials, the pricing call to action, FAQ, footer
  * (the footer itself lives in SiteLayout, which every public page shares).
  *
- * THE CHART IS THE ARGUMENT. The hero's job is to get a visitor to the chart
- * and then to the "Watch Live Vega" button; everything below it is supporting
- * evidence. That is why the chart is full-bleed and 640px tall rather than a
- * decorative card beside the headline — it is real recorded data and it is the
- * single most persuasive thing this product has.
+ * THE CHART IS THE ARGUMENT, and it now leads the page. It is real recorded
+ * data and it is the single most persuasive thing this product has, so a
+ * visitor meets it before any copy asks them to believe anything; the hero
+ * directly beneath then names what they have just been looking at and points
+ * them at "Watch Live Vega". That is also why the chart is full-bleed and
+ * 640px tall rather than a decorative card beside the headline.
+ *
+ * Only the ORDER of those two sections changed — both are byte-for-byte the
+ * markup they had when the hero came first, apart from the vertical padding
+ * that each one's new neighbour requires.
  *
  * All destinations are EXISTING routes. Nothing here adds, removes or changes
  * routing, auth or any API call.
@@ -58,8 +63,40 @@ export default function Home() {
 
   return (
     <>
-      {/* ===================== 1 · HERO ===================== */}
-      <section className="relative overflow-hidden px-5 pb-10 pt-14 sm:px-8 sm:pb-14 sm:pt-20">
+      {/* ===================== 1 · FULL-WIDTH VEGA CHART ===================== */}
+      {/*
+        FADE ONLY — NO TRANSFORM ON THIS WRAPPER.
+
+        Every other section here enters with a `y` / `scale` transform, and this
+        one deliberately does not. lightweight-charts sizes its canvas bitmaps
+        from `getBoundingClientRect()`, which reports TRANSFORMED geometry: with
+        a `scale()` on an ancestor the library reads a box that does not match
+        the element's layout size, fails to bind a size, and leaves every canvas
+        at the 300x150 HTML default stretched across a 1148px card. The visible
+        result is a blurry chart that overflows its container and cannot be
+        fixed by any later resize.
+
+        The chart does not need a transform to make an entrance in any case — it
+        already draws itself left to right on first paint, which is a better
+        one.
+
+        The padding is the only thing this section gained when it moved above
+        the hero: it is now the first block under the navbar, so it carries the
+        top spacing the hero used to.
+      */}
+      <section className="relative px-3 pb-10 pt-8 sm:px-6 sm:pb-12 sm:pt-12 lg:px-8">
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ duration: 0.7, delay: 0.15, ease: EASE }}
+          className="mx-auto w-full max-w-[1600px]"
+        >
+          <DelayedVegaPanel />
+        </motion.div>
+      </section>
+
+      {/* ===================== 2 · HERO ===================== */}
+      <section className="relative overflow-hidden px-5 pb-14 pt-10 sm:px-8 sm:pb-20 sm:pt-14">
         <motion.div
           initial="hidden"
           animate="show"
@@ -147,34 +184,6 @@ export default function Home() {
               </div>
             ))}
           </motion.div>
-        </motion.div>
-      </section>
-
-      {/* ===================== 2 · FULL-WIDTH VEGA CHART ===================== */}
-      {/*
-        FADE ONLY — NO TRANSFORM ON THIS WRAPPER.
-
-        Every other section here enters with a `y` / `scale` transform, and this
-        one deliberately does not. lightweight-charts sizes its canvas bitmaps
-        from `getBoundingClientRect()`, which reports TRANSFORMED geometry: with
-        a `scale()` on an ancestor the library reads a box that does not match
-        the element's layout size, fails to bind a size, and leaves every canvas
-        at the 300x150 HTML default stretched across a 1148px card. The visible
-        result is a blurry chart that overflows its container and cannot be
-        fixed by any later resize.
-
-        The chart does not need a transform to make an entrance in any case — it
-        already draws itself left to right on first paint, which is a better
-        one.
-      */}
-      <section className="relative px-3 pb-14 pt-4 sm:px-6 lg:px-8">
-        <motion.div
-          initial={{ opacity: 0 }}
-          animate={{ opacity: 1 }}
-          transition={{ duration: 0.7, delay: 0.15, ease: EASE }}
-          className="mx-auto w-full max-w-[1600px]"
-        >
-          <DelayedVegaPanel />
         </motion.div>
       </section>
 

@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   TbChevronLeft, TbChevronRight, TbCalendarStats, TbRefresh,
-  TbDatabase, TbBroadcast, TbClockHour4, TbChevronDown,
+  TbDatabase, TbBroadcast, TbClockHour4, TbChevronDown, TbCalendarTime,
 } from 'react-icons/tb';
 import api from '../../api/axios';
 import VegaChart, { SERIES_COLORS } from './VegaChart';
 
 /**
- * Vega Analysis — date-wise historical workspace.
+ * Vega Analysis — date-wise + expiry-wise historical workspace.
  *
  * Every number is computed server-side (vegaTimeseriesService + vegaMath) and
  * only read here; this component never sums vega.
@@ -22,6 +22,20 @@ import VegaChart, { SERIES_COLORS } from './VegaChart';
  * The date is anchored to the SERVER's IST day (`/dates` returns `today`), not
  * the browser clock — otherwise a user outside IST would ask for a date the
  * market has not traded yet and get an empty chart with no explanation.
+ *
+ * EXPIRY-WISE is the second axis, and it works the same way: `expiry` is a
+ * single piece of state that goes into ONE request, and the chart, the table
+ * and every tile are all rendered from that one response. There is no separate
+ * "chart data" and "table data" fetch to fall out of step — `points` is the
+ * single array both read, which is what makes the tooltip and the table
+ * numerically identical by construction rather than by luck.
+ *
+ * WHY THE EXPIRY LIST IS FETCHED PER {symbol, date}: which expiries exist is a
+ * property of the session, not of the app. Today offers the contracts the
+ * recorder is sampling right now; a past day offers exactly what it recorded,
+ * including contracts that have since expired and are gone from the instrument
+ * master. Resolving that on the server keeps the dropdown honest — it can only
+ * offer an expiry that will actually return data.
  */
 
 const SYMBOLS = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'SENSEX'];
@@ -349,6 +363,136 @@ function DateNavigator({
 }
 
 // ---------------------------------------------------------------------------
+// Expiry selector
+// ---------------------------------------------------------------------------
+
+/** An expiry reads as the same DD-MM-YYYY the date picker beside it uses. */
+const expiryLabel = (iso) => fmtDate(iso);
+
+/**
+ * How far out an expiry is, in trading terms the desk actually says out loud.
+ * The nearest one is "Current"; everything after it is counted from there.
+ */
+function expiryTag(index) {
+  if (index === 0) return 'Current';
+  if (index === 1) return 'Next';
+  return `+${index}`;
+}
+
+/**
+ * The expiry dropdown.
+ *
+ * Built as a listbox rather than a native <select> for the same reason the
+ * Sessions picker beside it is: each row carries a second line (how many points
+ * that expiry has, whether it is being recorded right now), which a native
+ * option cannot show and which is the difference between "this expiry is empty
+ * because the market is closed" and "this expiry is not being recorded".
+ *
+ * Closing on outside-click and Escape is handled the same way as the Sessions
+ * dropdown, so both behave identically.
+ */
+function ExpirySelector({ expiries, value, onChange, loading }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDown = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    const onKey = (e) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const activeIndex = expiries.findIndex((e) => e.expiry === value);
+
+  return (
+    <div className="flex items-center gap-2">
+      <span className="hidden text-2xs font-bold uppercase tracking-wider text-ink-500 sm:inline">
+        Expiry
+      </span>
+
+      <div className="relative" ref={ref}>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          disabled={!expiries.length && !value}
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          aria-label="Select expiry"
+          className="btn-secondary px-3 py-2 text-xs"
+        >
+          <TbCalendarTime size={16} />
+          <span className="num font-bold text-ink-900">
+            {value ? expiryLabel(value) : loading ? 'Loading…' : 'No expiry'}
+          </span>
+          {activeIndex >= 0 && (
+            <span className="rounded-full bg-vega-blue/10 px-1.5 text-2xs font-bold text-vega-blue">
+              {expiryTag(activeIndex)}
+            </span>
+          )}
+          <TbChevronDown
+            size={14}
+            className={open ? 'rotate-180 transition-transform' : 'transition-transform'}
+          />
+        </button>
+
+        {open && (
+          <div
+            role="listbox"
+            aria-label="Expiries"
+            className="scroll-thin absolute right-0 z-40 mt-1.5 max-h-80 w-[16rem] overflow-y-auto rounded-xl border border-vega-border bg-vega-panel p-1.5 shadow-glass-lg"
+          >
+            <p className="px-2 py-1.5 text-2xs font-bold uppercase tracking-wider text-ink-500">
+              Expiries for this session
+            </p>
+
+            {expiries.length === 0 && (
+              <p className="px-2 py-3 text-xs leading-relaxed text-ink-500">
+                No expiry recorded for this session yet.
+              </p>
+            )}
+
+            {expiries.map((e, i) => (
+              <button
+                key={e.expiry}
+                role="option"
+                aria-selected={e.expiry === value}
+                onClick={() => { onChange(e.expiry); setOpen(false); }}
+                className={`flex w-full items-center justify-between gap-2 rounded-lg px-2 py-2 text-left transition-colors ${
+                  e.expiry === value
+                    ? 'bg-vega-blue/10 text-vega-blue'
+                    : 'text-ink-700 hover:bg-vega-panel-muted hover:text-ink-900'
+                }`}
+              >
+                <span className="min-w-0">
+                  <span className="num block text-xs font-bold">{expiryLabel(e.expiry)}</span>
+                  <span className="block text-2xs font-medium text-ink-500">
+                    {fmtDateLong(e.expiry)}
+                    {e.recording ? ' · recording' : ''}
+                  </span>
+                </span>
+                <span className="flex shrink-0 items-center gap-1.5">
+                  <span className="rounded-full bg-vega-panel-muted px-1.5 py-0.5 text-2xs font-bold text-ink-600">
+                    {expiryTag(i)}
+                  </span>
+                  <span className="num rounded-full bg-vega-panel-muted px-2 py-0.5 text-2xs font-bold text-ink-600">
+                    {e.points}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -364,26 +508,94 @@ export default function VegaAnalysis() {
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [visible, setVisible] = useState({ call: true, put: true, diff: true });
+  // The point under the chart crosshair, so the matching table row can light
+  // up. Time only — the values are already in `points`, and duplicating them
+  // here is how a chart and a table drift apart.
+  const [hoverTime, setHoverTime] = useState(null);
+
+  /**
+   * Expiry selection, scoped to the {symbol, date} it was resolved for.
+   *
+   * `scope` is what makes this exactly one series request per change instead of
+   * two. Which expiries exist depends on the session, so on a symbol/date
+   * change the previous selection may be meaningless; until the list for the
+   * NEW scope has arrived we have no expiry worth asking for, and the series
+   * fetch below simply waits. Without the scope guard the page would fire once
+   * with the stale expiry and again with the corrected one — a wasted round
+   * trip and a visible flash of the wrong series.
+   */
+  const [expiryState, setExpiryState] = useState({ scope: null, list: [], value: null });
 
   const isToday = date === today;
+  const scope = `${symbol}|${date}`;
+  const expiryReady = expiryState.scope === scope;
+  const expiry = expiryReady ? expiryState.value : null;
+
+  // ---- expiries for the current {symbol, date} --------------------------
+  useEffect(() => {
+    let cancelled = false;
+    api.get(`/vega/${symbol}/expiries`, { params: { date } })
+      .then(({ data: d }) => {
+        if (cancelled) return;
+        const list = d.expiries || [];
+        setExpiryState((prev) => {
+          // Carry the user's choice across a date/symbol change WHEN that
+          // contract also exists in the new session; otherwise fall to the
+          // session's nearest expiry rather than showing an empty chart for a
+          // contract this day never recorded.
+          const keep = list.some((e) => e.expiry === prev.value) ? prev.value : null;
+          return { scope: `${symbol}|${date}`, list, value: keep || d.default || null };
+        });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // The series endpoint resolves a default expiry on its own, so an
+        // unreachable list must not block the chart — unblock the scope with an
+        // empty list and let the server choose.
+        setExpiryState({ scope: `${symbol}|${date}`, list: [], value: null });
+      });
+    return () => { cancelled = true; };
+  }, [symbol, date]);
+
+  const selectExpiry = useCallback((next) => {
+    setExpiryState((prev) => (prev.value === next ? prev : { ...prev, value: next }));
+  }, []);
+
+  /**
+   * Response-ordering guard.
+   *
+   * Flipping between expiries faster than the network answers leaves two
+   * requests in flight, and HTTP gives no guarantee they come back in order.
+   * Without this, the slower FIRST request can land last and repaint the chart
+   * and the table with the expiry the user has already navigated away from —
+   * while the dropdown still shows the new one. Stamping each request and
+   * ignoring anything but the newest makes that impossible.
+   */
+  const requestSeq = useRef(0);
 
   const load = useCallback(async () => {
+    const seq = (requestSeq.current += 1);
     try {
       // The date is ALWAYS sent, including for today. The server resolves and
-      // echoes it back, which keeps "what am I looking at" unambiguous.
+      // echoes it back, which keeps "what am I looking at" unambiguous. The
+      // expiry is sent the same way; when it is null the server falls back to
+      // the nearest one for that day and tells us which it picked.
       const { data: payload } = await api.get(`/vega/${symbol}/series`, {
-        params: { timeframe, date },
+        params: { timeframe, date, ...(expiry ? { expiry } : {}) },
       });
+      if (seq !== requestSeq.current) return;
       setData(payload);
       setError(null);
     } catch (err) {
+      if (seq !== requestSeq.current) return;
       setError(err.response?.data?.message || 'Could not load the vega series');
     } finally {
-      setLoading(false);
+      if (seq === requestSeq.current) setLoading(false);
     }
-  }, [symbol, timeframe, date]);
+  }, [symbol, timeframe, date, expiry]);
 
   useEffect(() => {
+    if (!expiryReady) return undefined; // wait for the expiry list for this scope
     setLoading(true);
     load();
     // Only poll for TODAY — a past day is finished, re-fetching it is waste.
@@ -392,7 +604,7 @@ export default function VegaAnalysis() {
       return () => clearInterval(id);
     }
     return undefined;
-  }, [load, isToday]);
+  }, [load, isToday, expiryReady]);
 
   // Days that actually have stored data, for the picker. Re-read on symbol
   // change and after each date change, so a day that has just gained its first
@@ -425,11 +637,20 @@ export default function VegaAnalysis() {
 
   const sessionForDate = sessions.find((s) => s.date === date);
 
+  // What the dropdown shows and what the header labels. `data.expiries` is the
+  // same list the series response resolved against, so it is used as the
+  // fallback when the dedicated call has not answered — the two can never
+  // disagree about which expiry produced the points on screen.
+  const expiryOptions = expiryState.list.length ? expiryState.list : (data?.expiries ?? []);
+  const activeExpiry = expiry || data?.expiry || null;
+
+  const expiryText = activeExpiry ? fmtDate(activeExpiry) : null;
+
   const emptyMessage = !isToday
-    ? `No data stored for ${symbol} on ${fmtDate(date)}. It may have been a weekend or a market holiday, or it may predate the recorder.`
+    ? `No data stored for ${symbol}${expiryText ? ` (expiry ${expiryText})` : ''} on ${fmtDate(date)}. It may have been a weekend or a market holiday, it may predate the recorder, or that expiry was not being recorded on that day.`
     : data?.hasBaseline
-      ? `No samples yet for ${symbol} today. The first point lands within a minute.`
-      : `Waiting for the day-open baseline for ${symbol}. Recording runs 09:15–15:30 IST on trading days — pick a stored session to review history.`;
+      ? `No samples yet for ${symbol}${expiryText ? ` (expiry ${expiryText})` : ''} today. The first point lands within a minute.`
+      : `Waiting for the day-open baseline for ${symbol}${expiryText ? ` (expiry ${expiryText})` : ''}. Recording runs 09:15–15:30 IST on trading days — pick a stored session to review history.`;
 
   return (
     <div className="animate-fade-in space-y-4">
@@ -457,6 +678,12 @@ export default function VegaAnalysis() {
           <span className="num pill border-vega-border bg-vega-panel text-ink-700">
             {fmtDate(data?.date || date)}
           </span>
+          {expiryText && (
+            <span className="pill border-vega-border bg-vega-panel text-ink-700">
+              Exp
+              <span className="num font-bold text-ink-900">{expiryText}</span>
+            </span>
+          )}
         </div>
       </div>
 
@@ -505,14 +732,15 @@ export default function VegaAnalysis() {
             />
           </div>
 
-          {(latest?.expiry || data?.expiry) && (
-            <span className="hidden items-center gap-1.5 text-xs text-ink-500 md:inline-flex">
-              Expiry
-              <span className="num font-bold text-ink-900">
-                {fmtDate(String(data?.expiry || latest?.expiry).slice(0, 10))}
-              </span>
-            </span>
-          )}
+          {/* Changing this refetches the series for the chosen contract; the
+              chart, the table and every tile below re-render from that one
+              response, so they move together by construction. */}
+          <ExpirySelector
+            expiries={expiryOptions}
+            value={activeExpiry}
+            onChange={selectExpiry}
+            loading={loading}
+          />
         </div>
       </div>
 
@@ -639,6 +867,7 @@ export default function VegaAnalysis() {
                 visible={visible}
                 loading={loading}
                 emptyLabel={error ? null : emptyMessage}
+                onHoverPoint={setHoverTime}
               />
             </div>
           </section>
@@ -648,6 +877,13 @@ export default function VegaAnalysis() {
         <section className="glass-card flex min-w-0 flex-col overflow-hidden">
           <div className="panel-head">
             <h2 className="panel-title">Time-wise Records</h2>
+            {/* Naming the expiry here is what stops the table being read as
+                "all expiries" once the dropdown exists. */}
+            {expiryText && (
+              <span className="num rounded-full bg-vega-panel-muted px-2 py-0.5 text-2xs font-bold text-ink-600">
+                {expiryText}
+              </span>
+            )}
             <span className="num ml-auto rounded-full bg-vega-panel-muted px-2 py-0.5 text-2xs font-bold text-ink-600">
               {points.length}
             </span>
@@ -679,7 +915,11 @@ export default function VegaAnalysis() {
                   </tr>
                 )}
                 {tableRows.map((p) => (
-                  <tr key={p.time}>
+                  // Hovering the chart lights up the row it came from. Both are
+                  // rendered from the same `points` array, so this is a visual
+                  // confirmation that the tooltip and the table are reading the
+                  // identical record — not a second copy of the numbers.
+                  <tr key={p.time} className={p.time === hoverTime ? 'row-linked' : undefined}>
                     <td className="num font-semibold text-ink-700">{fmtTime(p.time)}</td>
                     <td className={`text-right ${p.callVegaDiff >= 0 ? 'val-up' : 'val-down'}`}>
                       {fmt(p.callVegaDiff)}

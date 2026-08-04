@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createChart, ColorType, LineStyle, CrosshairMode } from 'lightweight-charts';
 
 /**
@@ -63,7 +63,16 @@ function heightFor(viewportWidth, viewportHeight) {
   return Math.max(440, Math.min(Math.round((viewportHeight || 800) * 0.5), 560));
 }
 
-function VegaChart({ points, visible = {}, loading = false, emptyLabel }) {
+/**
+ * Tooltip geometry. The card is positioned from the crosshair and then clamped
+ * inside the chart box, so it never hangs off the left edge of a phone-width
+ * card or over the price axis on the right.
+ */
+const TOOLTIP_WIDTH = 176;
+const TOOLTIP_HEIGHT = 116;
+const TOOLTIP_GAP = 14;
+
+function VegaChart({ points, visible = {}, loading = false, emptyLabel, onHoverPoint }) {
   const wrapRef = useRef(null);
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -76,9 +85,24 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel }) {
   const { height } = size;
   const [isNarrow, setIsNarrow] = useState(false);
 
-  // Crosshair readout. Falls back to the newest point when the pointer is away,
-  // so the header always shows something meaningful.
+  // The hovered point: its values AND where the crosshair is, so the tooltip
+  // can follow the pointer. Null whenever the pointer is off the plot.
   const [hover, setHover] = useState(null);
+
+  // The parent uses this to highlight the matching row in the records table.
+  // Held in a ref so a new callback identity never tears down the chart, and
+  // only fired when the hovered MINUTE changes — a crosshair move emits on
+  // every mouse pixel, and re-rendering the whole table that often would make
+  // the page stutter.
+  const onHoverPointRef = useRef(onHoverPoint);
+  onHoverPointRef.current = onHoverPoint;
+  const lastHoverTimeRef = useRef(null);
+
+  const emitHover = useCallback((time) => {
+    if (lastHoverTimeRef.current === time) return;
+    lastHoverTimeRef.current = time;
+    onHoverPointRef.current?.(time);
+  }, []);
 
   // ---- responsive sizing -------------------------------------------------
   /**
@@ -210,23 +234,50 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel }) {
       title: '',
     });
 
+    /**
+     * The tooltip feed.
+     *
+     * `seriesData` is what the library resolved for the hovered time on each
+     * series, so the three numbers are read from the exact same points the
+     * lines were drawn from — the tooltip can never disagree with the curve,
+     * and since the table renders the same `points` array, it cannot disagree
+     * with the table either.
+     *
+     * A series the user has toggled off is absent from `seriesData`; the
+     * tooltip falls back to the raw point for that row (see `hoverPoint`
+     * below) so hiding a line never blanks its number.
+     */
     chart.subscribeCrosshairMove((param) => {
-      if (!param?.time || !param.point) { setHover(null); return; }
+      if (!param?.time || !param.point) {
+        setHover(null);
+        emitHover(null);
+        return;
+      }
       const read = (s) => {
         const v = param.seriesData.get(s);
         return v && typeof v.value === 'number' ? v.value : null;
       };
       setHover({
         time: param.time,
+        x: param.point.x,
+        y: param.point.y,
         call: read(seriesRef.current.call),
         put: read(seriesRef.current.put),
         diff: read(seriesRef.current.diff),
       });
+      emitHover(param.time);
     });
 
     chartRef.current = chart;
-    return () => { chart.remove(); chartRef.current = null; };
-  }, []);
+    return () => {
+      chart.remove();
+      chartRef.current = null;
+      // The parent must not be left highlighting a row for a chart that no
+      // longer exists.
+      lastHoverTimeRef.current = null;
+      onHoverPointRef.current?.(null);
+    };
+  }, [emitHover]);
 
   /**
    * The single resize point.
@@ -325,19 +376,31 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel }) {
   const resetZoom = useCallback(() => chartRef.current?.timeScale().fitContent(), []);
 
   const latest = points?.length ? points[points.length - 1] : null;
-  const readout = hover || (latest && {
+
+  // The raw point behind the crosshair. It backfills any series the user has
+  // hidden, so the tooltip always shows all four values even when only one
+  // line is drawn.
+  const hoverPoint = useMemo(
+    () => (hover?.time == null ? null : points?.find((p) => p.time === hover.time) || null),
+    [hover?.time, points]
+  );
+
+  const readout = latest && {
     time: latest.time,
     call: latest.callVegaDiff,
     put: latest.putVegaDiff,
     diff: latest.vegaDiff,
-  });
+  };
 
   const hasPoints = !!points?.length;
 
   return (
     <div ref={wrapRef} className="relative w-full" style={{ height }}>
-      {/* Crosshair / latest readout. Constrained width + wrapping so it never
-          runs off the left edge of a phone-width card. */}
+      {/* Latest readout. Constrained width + wrapping so it never runs off the
+          left edge of a phone-width card. This stays pinned to the NEWEST point
+          rather than following the crosshair — the tooltip below is what
+          answers "what is under my cursor", and having both chase the pointer
+          left nowhere showing the current value. */}
       {readout && hasPoints && (
         <div className="pointer-events-none absolute left-2 top-2 z-10 flex max-w-[calc(100%-5.5rem)] flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-vega-border bg-vega-panel/95 px-2.5 py-1.5 shadow-sm backdrop-blur-sm">
           <span className="num text-2xs font-bold text-ink-900">{fmtIst(readout.time)}</span>
@@ -345,6 +408,23 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel }) {
           <Readout label="Put" value={readout.put} color={SERIES_COLORS.put} />
           <Readout label="Diff" value={readout.diff} color={SERIES_COLORS.diff} />
         </div>
+      )}
+
+      {/* Hover tooltip — Time / Call Vega / Put Vega / Difference for the point
+          under the crosshair. */}
+      {hover && hasPoints && (
+        <ChartTooltip
+          time={hover.time}
+          call={hover.call ?? hoverPoint?.callVegaDiff}
+          put={hover.put ?? hoverPoint?.putVegaDiff}
+          diff={hover.diff ?? hoverPoint?.vegaDiff}
+          trend={hoverPoint?.trend}
+          trendColor={hoverPoint?.trendColor}
+          x={hover.x}
+          y={hover.y}
+          boxWidth={size.width}
+          boxHeight={height}
+        />
       )}
 
       {hasPoints && (
@@ -373,6 +453,73 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel }) {
       )}
 
       <div ref={containerRef} className="h-full w-full" />
+    </div>
+  );
+}
+
+/**
+ * The hover tooltip.
+ *
+ * Positioned from the crosshair and CLAMPED into the chart box, so it is
+ * readable at every point of the curve instead of being cut off at the edges:
+ * it flips to the left of the cursor once there is not enough room on the
+ * right, and rides up against the bottom edge rather than overflowing it.
+ *
+ * `pointer-events-none` matters — a tooltip that can be hovered would steal
+ * the crosshair from the chart underneath it and flicker.
+ */
+function ChartTooltip({ time, call, put, diff, trend, trendColor, x, y, boxWidth, boxHeight }) {
+  const width = boxWidth || 0;
+  const height = boxHeight || 0;
+
+  // Prefer the right of the cursor; flip left when the card would clip.
+  const flip = width > 0 && x + TOOLTIP_GAP + TOOLTIP_WIDTH > width;
+  const left = flip ? x - TOOLTIP_GAP - TOOLTIP_WIDTH : x + TOOLTIP_GAP;
+  const top = y - TOOLTIP_HEIGHT / 2;
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(v, max));
+
+  return (
+    <div
+      role="tooltip"
+      className="pointer-events-none absolute z-30 rounded-lg border border-vega-border-strong bg-vega-panel/95 px-3 py-2 shadow-glass-lg backdrop-blur-sm"
+      style={{
+        width: TOOLTIP_WIDTH,
+        left: width ? clamp(left, 4, Math.max(4, width - TOOLTIP_WIDTH - 4)) : left,
+        top: height ? clamp(top, 4, Math.max(4, height - TOOLTIP_HEIGHT - 4)) : top,
+      }}
+    >
+      <div className="flex items-baseline justify-between gap-2 border-b border-vega-border pb-1.5">
+        <span className="text-2xs font-bold uppercase tracking-wider text-ink-500">Time</span>
+        <span className="num text-xs font-bold text-ink-900">{fmtIst(time)}</span>
+      </div>
+
+      <div className="mt-1.5 space-y-1">
+        <TooltipRow label="Call Vega" value={call} color={SERIES_COLORS.call} />
+        <TooltipRow label="Put Vega" value={put} color={SERIES_COLORS.put} />
+        <TooltipRow label="Difference" value={diff} color={SERIES_COLORS.diff} />
+      </div>
+
+      {trend && (
+        <div className="mt-1.5 flex items-center gap-1.5 border-t border-vega-border pt-1.5">
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: trendColor }} />
+          <span className="text-2xs font-bold uppercase tracking-wide" style={{ color: trendColor }}>
+            {trend}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TooltipRow({ label, value, color }) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="flex min-w-0 items-center gap-1.5">
+        <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: color }} />
+        <span className="truncate text-2xs font-semibold text-ink-600">{label}</span>
+      </span>
+      <span className="num shrink-0 text-xs font-bold" style={{ color }}>{fmtNum(value)}</span>
     </div>
   );
 }

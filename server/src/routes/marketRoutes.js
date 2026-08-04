@@ -63,7 +63,7 @@ router.get('/option-chain/:underlying', authenticate, requirePremium, (req, res)
   }
 });
 
-// GET /api/market/vega-analysis/:underlying
+// GET /api/market/vega-analysis/:underlying?expiry=YYYY-MM-DD
 //
 // UNIFIED: this used to call the now-removed utils/vegaAnalysisEngine.js (an
 // OI-weighted, slope-based duplicate). It now serves the SAME data as
@@ -71,19 +71,28 @@ router.get('/option-chain/:underlying', authenticate, requirePremium, (req, res)
 // exactly one source of truth for Vega. Response shape is preserved
 // (underlying/spot/snapshot/history) for backward compatibility; `snapshot` is
 // the latest decorated point (with trend) and `history` is today's series.
+//
+// `expiry` is optional and defaults to the nearest recorded expiry, so callers
+// written before the series became expiry-wise keep getting exactly what they
+// got before.
 router.get('/vega-analysis/:underlying', authenticate, requirePremium, (req, res) => {
   try {
     const cfgU = getUnderlying(req.params.underlying);
     if (!cfgU) return res.status(404).json({ message: `Unknown symbol: ${req.params.underlying}` });
 
     const tick = latestTicks.get(cfgU.spotToken);
-    const history = vegaTimeseriesService.getSeries(cfgU.key, '1m');
+    const expiry = req.query.expiry
+      ? String(req.query.expiry).slice(0, 10)
+      : vegaTimeseriesService.defaultLiveExpiry(cfgU.key);
+    const history = vegaTimeseriesService.getSeries(cfgU.key, '1m', expiry);
 
     res.json({
       underlying: cfgU.key,
+      expiry: expiry || null,
+      expiries: vegaTimeseriesService.trackedExpiries(cfgU.key),
       spot: tick?.lastPrice ?? null,
-      snapshot: vegaTimeseriesService.getLatest(cfgU.key), // latest point + trend
-      dayOpen: vegaTimeseriesService.getDayOpen(cfgU.key),
+      snapshot: vegaTimeseriesService.getLatest(cfgU.key, expiry), // latest point + trend
+      dayOpen: vegaTimeseriesService.getDayOpen(cfgU.key, expiry),
       history,
     });
   } catch (err) {

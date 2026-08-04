@@ -185,6 +185,19 @@
     @apply border-b-0;
   }
 
+  /* A row linked to something the user is pointing at elsewhere — today that
+     is the Vega chart's crosshair highlighting the minute it is reading. It
+     has to beat the :nth-child(even) stripe, hence the higher specificity and
+     the !important on the background; without it every second row would show
+     no highlight at all. */
+  .data-table tbody tr.row-linked td {
+    @apply !bg-vega-blue/[0.12] font-semibold text-ink-900;
+    box-shadow: inset 2px 0 0 0 theme('colors.vega-blue');
+  }
+  .data-table tbody tr.row-linked td:not(:first-child) {
+    box-shadow: none;
+  }
+
   /* ---- Value semantics ------------------------------------------------- */
 
   .text-gain { @apply text-vega-green; }

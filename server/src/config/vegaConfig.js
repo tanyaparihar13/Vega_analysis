@@ -49,6 +49,21 @@ module.exports = {
   DELTA_MAX: 0.6,           // PHP: hard-coded 0.6 ceiling in addvega.php
   STRIKE_MODE: 'dynamic',   // 'dynamic' (addvega.php parity) | 'frozen'
   STRIKE_WINDOW: 30,        // how many strikes either side of ATM to build
+
+  /**
+   * How many expiries per underlying the recorder tracks, nearest first
+   * (current expiry, next weekly, the one after that...).
+   *
+   * TOKEN BUDGET — the reason this is a small number and not "all of them".
+   * Kite allows ~3,000 instrument tokens per WebSocket connection. One tracked
+   * expiry costs (2 * STRIKE_WINDOW + 1) * 2 tokens = 122 at the default
+   * window, per underlying. Five underlyings x 3 expiries = ~1,830 standing
+   * tokens, leaving room for the option-chain subscriptions live browsers add
+   * on top. Raising this past 4 will trip the warning in subscriptionManager
+   * and eventually the exchange limit itself, so raise STRIKE_WINDOW down
+   * first if you need more expiries.
+   */
+  EXPIRY_COUNT: Math.max(1, Math.min(Number(process.env.VEGA_EXPIRY_COUNT) || 3, 6)),
   MARKET_OPEN_MIN: 555,     // 09:15 IST, in minutes-from-midnight
   MARKET_CLOSE_MIN: 930,    // 15:30 IST
   SAMPLE_CRON: '*/1 9-15 * * 1-5', // every minute, market hours, Mon-Fri

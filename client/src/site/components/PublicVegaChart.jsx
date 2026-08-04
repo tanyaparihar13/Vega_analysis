@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createChart, ColorType, LineStyle, CrosshairMode } from 'lightweight-charts';
 
 /**
@@ -48,17 +48,22 @@ const fmtIst = (unixSeconds) => IST_TIME.format(new Date(unixSeconds * 1000));
  *
  * Two ladders, because the chart appears at two very different jobs:
  *
- *   hero   the full-bleed centrepiece under the headline. Tall enough to be
- *          the thing you look at (640px on a desktop), but still tiered down
- *          on a phone — a 640px canvas on a 375px screen is a wall, not a
- *          chart, and it would push every CTA below the fold.
+ *   hero   the full-bleed centrepiece of the page. Tall enough to be the thing
+ *          you look at (640px on a desktop), but still tiered down on a phone —
+ *          a 640px canvas on a 375px screen is a wall, not a chart, and it
+ *          would push every CTA below the fold.
  *   panel  a chart inside a normal card elsewhere on the site.
+ *
+ * The hero's top tier starts at 1100px rather than 1280 because the hero chart
+ * now shares its row with the unlock card (see DelayedVegaPanel) — it measures
+ * ~1210px inside a 1600px panel, and the old 1280 threshold would have quietly
+ * demoted the widest desktop layout to the 540px tier.
  */
 function heightFor(width, variant) {
   if (variant === 'hero') {
     if (width < 480) return 340;
     if (width < 768) return 420;
-    if (width < 1280) return 540;
+    if (width < 1100) return 540;
     return 640;
   }
   if (width < 480) return 260;
@@ -68,6 +73,17 @@ function heightFor(width, variant) {
 }
 
 const REVEAL_MS = 1200;
+
+const fmtNum = (v) => (v == null || Number.isNaN(Number(v)) ? '–' : Number(v).toFixed(2));
+
+/**
+ * Hover-tooltip geometry. The card is placed from the crosshair and clamped
+ * inside the chart box, so it stays readable at both ends of the curve instead
+ * of being cut off by the price axis or the left edge.
+ */
+const TOOLTIP_WIDTH = 178;
+const TOOLTIP_HEIGHT = 120;
+const TOOLTIP_GAP = 14;
 
 const prefersReducedMotion = () =>
   typeof window !== 'undefined'
@@ -93,6 +109,16 @@ function PublicVegaChart({ points, loading = false, emptyLabel, variant = 'panel
   // imperatively via `appliedRef` below, so keeping it in state as well would
   // re-render the component on every pixel of a drag-resize for nothing.
   const [height, setHeight] = useState(() => heightFor(1280, variant));
+
+  // The measured width, kept in a ref for the same reason: the ONLY thing that
+  // reads it is the tooltip's clamp, which is evaluated during a render that
+  // hovering has already caused. Putting it in state would re-render the whole
+  // chart on every pixel of a resize to move a card that is not on screen.
+  const widthRef = useRef(0);
+
+  // The hovered point plus the crosshair position. Null when the pointer is off
+  // the plot, which is also what unmounts the tooltip.
+  const [hover, setHover] = useState(null);
 
   // ---- responsive sizing -------------------------------------------------
   /**
@@ -126,6 +152,8 @@ function PublicVegaChart({ points, loading = false, emptyLabel, variant = 'panel
 
     const width = Math.floor(el.getBoundingClientRect().width);
     if (!width) return;
+
+    widthRef.current = width;
 
     setHeight((prev) => {
       const next = heightFor(width, variantRef.current);
@@ -261,6 +289,33 @@ function PublicVegaChart({ points, loading = false, emptyLabel, variant = 'panel
       title: '',
     });
 
+    /**
+     * The hover tooltip's feed.
+     *
+     * `seriesData` is what the library resolved for the hovered time on each
+     * line, so the three numbers come from the exact points the curve was drawn
+     * from — the tooltip cannot show anything the chart is not showing.
+     *
+     * Note this is a READ-ONLY subscription: `handleScroll` / `handleScale`
+     * stay off, so hovering reveals values without letting a marketing page
+     * swallow the visitor's scroll.
+     */
+    chart.subscribeCrosshairMove((param) => {
+      if (!param?.time || !param.point) { setHover(null); return; }
+      const read = (s) => {
+        const v = param.seriesData.get(s);
+        return v && typeof v.value === 'number' ? v.value : null;
+      };
+      setHover({
+        time: param.time,
+        x: param.point.x,
+        y: param.point.y,
+        call: read(seriesRef.current.call),
+        put: read(seriesRef.current.put),
+        diff: read(seriesRef.current.diff),
+      });
+    });
+
     chartRef.current = chart;
 
     // Make sure the wrapper's height reflects the live container width before
@@ -288,6 +343,8 @@ function PublicVegaChart({ points, loading = false, emptyLabel, variant = 'panel
     if (!points.length) {
       s.call.setData([]); s.put.setData([]); s.diff.setData([]);
       hasRevealedRef.current = false;
+      // A tooltip for a point that no longer exists would be worse than none.
+      setHover(null);
       return undefined;
     }
 
@@ -344,8 +401,30 @@ function PublicVegaChart({ points, loading = false, emptyLabel, variant = 'panel
 
   const hasPoints = !!points?.length;
 
+  // The raw point behind the crosshair, for the trend label the series data
+  // does not carry.
+  const hoverPoint = useMemo(
+    () => (hover?.time == null ? null : points?.find((p) => p.time === hover.time) || null),
+    [hover?.time, points]
+  );
+
   return (
     <div ref={wrapRef} className="relative w-full" style={{ height }}>
+      {hover && hasPoints && (
+        <PublicChartTooltip
+          time={hover.time}
+          call={hover.call ?? hoverPoint?.callVegaDiff}
+          put={hover.put ?? hoverPoint?.putVegaDiff}
+          diff={hover.diff ?? hoverPoint?.vegaDiff}
+          trend={hoverPoint?.trend}
+          trendColor={hoverPoint?.trendColor}
+          x={hover.x}
+          y={hover.y}
+          boxWidth={widthRef.current}
+          boxHeight={height}
+        />
+      )}
+
       {loading && !hasPoints && (
         <div className="absolute inset-0 z-20 grid place-items-center">
           <div className="flex flex-col items-center gap-3">
@@ -364,6 +443,82 @@ function PublicVegaChart({ points, loading = false, emptyLabel, variant = 'panel
       )}
 
       <div ref={containerRef} className="h-full w-full" />
+    </div>
+  );
+}
+
+/**
+ * The hover tooltip for the public chart.
+ *
+ * Same information as the terminal's — Time, Call Vega, Put Vega, Difference —
+ * but styled for this page's near-black surface rather than the terminal's
+ * white card, which is the same reason PUBLIC_SERIES_COLORS exists.
+ *
+ * `pointer-events-none` is required, not cosmetic: a hoverable tooltip would
+ * take the pointer off the canvas underneath it, the crosshair would clear, the
+ * tooltip would unmount, the pointer would land back on the canvas — and the
+ * card would flicker at 60fps wherever it sat under the cursor.
+ */
+function PublicChartTooltip({ time, call, put, diff, trend, trendColor, x, y, boxWidth, boxHeight }) {
+  const width = boxWidth || 0;
+  const height = boxHeight || 0;
+
+  // Prefer the right of the cursor, flip to the left when it would clip.
+  const flip = width > 0 && x + TOOLTIP_GAP + TOOLTIP_WIDTH > width;
+  const left = flip ? x - TOOLTIP_GAP - TOOLTIP_WIDTH : x + TOOLTIP_GAP;
+  const top = y - TOOLTIP_HEIGHT / 2;
+
+  const clamp = (v, min, max) => Math.max(min, Math.min(v, max));
+
+  return (
+    <div
+      role="tooltip"
+      className="pointer-events-none absolute z-30 rounded-xl border border-white/10 bg-[rgba(8,12,16,0.96)] px-3.5 py-2.5 shadow-card backdrop-blur-xl"
+      style={{
+        width: TOOLTIP_WIDTH,
+        left: width ? clamp(left, 4, Math.max(4, width - TOOLTIP_WIDTH - 4)) : left,
+        top: height ? clamp(top, 4, Math.max(4, height - TOOLTIP_HEIGHT - 4)) : top,
+      }}
+    >
+      <div className="flex items-baseline justify-between gap-2 border-b border-white/[0.08] pb-2">
+        <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-muted">Time</span>
+        <span className="font-mono text-xs font-bold tabular-nums text-text">{fmtIst(time)}</span>
+      </div>
+
+      <div className="mt-2 space-y-1.5">
+        <PublicTooltipRow label="Call Vega" value={call} color={PUBLIC_SERIES_COLORS.call} />
+        <PublicTooltipRow label="Put Vega" value={put} color={PUBLIC_SERIES_COLORS.put} />
+        <PublicTooltipRow label="Difference" value={diff} color={PUBLIC_SERIES_COLORS.diff} />
+      </div>
+
+      {trend && (
+        <div className="mt-2 flex items-center gap-1.5 border-t border-white/[0.08] pt-2">
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: trendColor }} />
+          <span
+            className="text-[10px] font-bold uppercase tracking-[0.12em]"
+            style={{ color: trendColor }}
+          >
+            {trend}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PublicTooltipRow({ label, value, color }) {
+  return (
+    <div className="flex items-center justify-between gap-2">
+      <span className="flex min-w-0 items-center gap-1.5">
+        <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: color }} />
+        <span className="truncate text-[11px] font-semibold text-muted">{label}</span>
+      </span>
+      <span
+        className="shrink-0 font-mono text-xs font-bold tabular-nums"
+        style={{ color }}
+      >
+        {fmtNum(value)}
+      </span>
     </div>
   );
 }

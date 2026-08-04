@@ -4,6 +4,13 @@
  * Recreates vega_day_open / vega_timeseries with the schema that
  * services/vegaTimeseriesService.js actually expects (open_chain JSON,
  * open_call_vega, open_put_vega) instead of the old flat-column shape.
+ *
+ * KEEP THIS DDL IN STEP WITH src/schema.vega.sql. The recorder is expiry-wise,
+ * so `expiry` is NOT NULL and part of both primary keys. Recreating these
+ * tables on the pre-expiry key would not fail loudly — the second expiry
+ * sampled in a minute would simply collide with the first and be overwritten
+ * by the ON DUPLICATE KEY UPDATE, and the expiry dropdown would quietly show
+ * one series under several labels.
  */
 const mysql = require('mysql2/promise');
 require('dotenv').config();
@@ -15,7 +22,7 @@ DROP TABLE IF EXISTS vega_day_open;
 CREATE TABLE vega_day_open (
   snapshot_date DATE        NOT NULL,
   symbol        VARCHAR(20) NOT NULL,
-  expiry        DATE        DEFAULT NULL,
+  expiry        DATE        NOT NULL,
   captured_at   DATETIME    NOT NULL,
 
   open_chain    JSON        NOT NULL,
@@ -24,14 +31,14 @@ CREATE TABLE vega_day_open (
 
   created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-  PRIMARY KEY (snapshot_date, symbol)
+  PRIMARY KEY (snapshot_date, symbol, expiry)
 ) ENGINE=InnoDB;
 
 CREATE TABLE vega_timeseries (
   snapshot_date     DATE          NOT NULL,
   symbol            VARCHAR(20)   NOT NULL,
   sampled_at        DATETIME      NOT NULL,
-  expiry            DATE          DEFAULT NULL,
+  expiry            DATE          NOT NULL,
 
   call_vega_diff    DECIMAL(16,4) NOT NULL DEFAULT 0,
   put_vega_diff     DECIMAL(16,4) NOT NULL DEFAULT 0,
@@ -47,8 +54,8 @@ CREATE TABLE vega_timeseries (
   put_strike_count  SMALLINT UNSIGNED NOT NULL DEFAULT 0,
   created_at        DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-  PRIMARY KEY (snapshot_date, symbol, sampled_at),
-  INDEX idx_vega_series (symbol, snapshot_date, sampled_at)
+  PRIMARY KEY (snapshot_date, symbol, expiry, sampled_at),
+  INDEX idx_vega_series (symbol, snapshot_date, expiry, sampled_at)
 ) ENGINE=InnoDB;
 `;
 
