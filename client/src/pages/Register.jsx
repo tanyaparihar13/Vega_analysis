@@ -1,6 +1,10 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import { HiOutlineMail, HiOutlineUser, HiOutlinePhone, HiOutlineArrowRight } from 'react-icons/hi';
 import { useAuth } from '../context/AuthContext';
+import AuthShell, { Field, AuthError } from '../components/auth/AuthShell';
+import PasswordField from '../components/auth/PasswordField';
+import PasswordStrength, { evaluatePassword, PASSWORD_MIN } from '../components/auth/PasswordStrength';
 
 /**
  * Signup step 1 of the approval flow:
@@ -10,8 +14,14 @@ import { useAuth } from '../context/AuthContext';
  *
  * The WhatsApp handoff uses the plain click-to-chat URL (https://wa.me/...),
  * NOT the WhatsApp Business API: it only opens a chat with the message typed
- * in, and the user sends it themselves. Nothing is transmitted on their behalf.
+ * in, and the user sends it themselves. Nothing is transmitted on their behalf,
+ * and the message carries identity details only — never the password.
+ *
+ * The registration call itself is unchanged. What is new is the show/hide
+ * control, the live strength meter, and client-side password validation that
+ * mirrors the server's rules so a rejection is caught before the round trip.
  */
+
 /**
  * Demat brokers, in the order the form shows them.
  *
@@ -35,8 +45,16 @@ export default function Register() {
     name: '', email: '', password: '', mobile: '', broker: '',
   });
   const [error, setError] = useState('');
+  // Only true once the field has been left, so the meter never turns red while
+  // somebody is still on the third character of a good password.
+  const [passwordTouched, setPasswordTouched] = useState(false);
 
   const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.value }));
+
+  const { isValid: passwordValid } = useMemo(
+    () => evaluatePassword(form.password),
+    [form.password]
+  );
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -50,6 +68,13 @@ export default function Register() {
     }
     if (!form.broker) {
       setError('Please select your demat broker.');
+      return;
+    }
+    if (!passwordValid) {
+      setPasswordTouched(true);
+      setError(
+        `Please choose a password with at least ${PASSWORD_MIN} characters, including a letter and a number.`
+      );
       return;
     }
 
@@ -70,6 +95,10 @@ export default function Register() {
           broker: result.user?.brokerLabel
             || BROKERS.find((b) => b.value === form.broker)?.label
             || null,
+          // Carried through so the pending screen — and its rebuilt WhatsApp
+          // fallback — can show the same details the server put in the message.
+          userId: result.user?.id ?? null,
+          accountType: result.user?.accountType ?? null,
           whatsappUrl: result.whatsappUrl,
         },
       });
@@ -79,78 +108,114 @@ export default function Register() {
   };
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-vega-black px-4 py-10">
-      <div className="glass-card w-full max-w-md p-8">
-        <div className="mb-7 text-center">
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-            Vega <span className="text-vega-blue">Analysis</span>
-          </h1>
-          <p className="mt-1 text-sm text-slate-500">Create your account</p>
+    <AuthShell
+      title="Open your account"
+      subtitle="Register for the Vega Analysis terminal. An administrator reviews every account before access is granted."
+      width="max-w-lg"
+      footer={
+        <>
+          Already have an account?{' '}
+          <Link to="/login" className="font-semibold text-primary hover:underline">
+            Sign in
+          </Link>
+        </>
+      }
+    >
+      <form onSubmit={handleSubmit} className="space-y-5">
+        <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
+          <Field label="Full Name" htmlFor="reg-name">
+            <div className="relative">
+              <HiOutlineUser
+                size={17}
+                className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-muted"
+                aria-hidden="true"
+              />
+              <input
+                id="reg-name" required autoComplete="name" className="site-input !pl-10"
+                value={form.name} onChange={set('name')} placeholder="Jane Trader"
+              />
+            </div>
+          </Field>
+
+          <Field label="Mobile Number" htmlFor="reg-mobile">
+            <div className="relative">
+              <HiOutlinePhone
+                size={17}
+                className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-muted"
+                aria-hidden="true"
+              />
+              <input
+                id="reg-mobile" type="tel" required autoComplete="tel" inputMode="numeric"
+                className="site-input !pl-10"
+                value={form.mobile} onChange={set('mobile')} placeholder="9876543210"
+              />
+            </div>
+          </Field>
         </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <Field label="Full Name">
-            <input required className="input-dark w-full" value={form.name}
-              onChange={set('name')} placeholder="Jane Trader" />
-          </Field>
-
-          <Field label="Email">
-            <input type="email" required className="input-dark w-full" value={form.email}
-              onChange={set('email')} placeholder="you@example.com" />
-          </Field>
-
-          <Field label="Mobile Number">
-            <input type="tel" required className="input-dark w-full" value={form.mobile}
-              onChange={set('mobile')} placeholder="9876543210" inputMode="numeric" />
-          </Field>
-
-          <Field label="Demat Broker">
-            <select required className="input-dark w-full" value={form.broker} onChange={set('broker')}>
-              <option value="" disabled>Select your broker</option>
-              {BROKERS.map((b) => (
-                <option key={b.value} value={b.value}>{b.label}</option>
-              ))}
-            </select>
-          </Field>
-
-          <Field label="Password">
-            <input type="password" required minLength={8} className="input-dark w-full"
-              value={form.password} onChange={set('password')} placeholder="Minimum 8 characters" />
-          </Field>
-
-          {error && (
-            <p className="rounded-lg bg-vega-red/10 px-3 py-2 text-sm text-vega-red">{error}</p>
-          )}
-
-          <div className="rounded-lg border border-vega-border bg-slate-50 px-3 py-2.5 text-xs leading-relaxed text-slate-500">
-            After registering, WhatsApp will open with a prefilled message to the
-            administrator. <span className="font-medium text-slate-700">Press Send</span> to
-            request approval — your account stays pending until it is approved.
+        <Field label="Email" htmlFor="reg-email">
+          <div className="relative">
+            <HiOutlineMail
+              size={17}
+              className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-muted"
+              aria-hidden="true"
+            />
+            <input
+              id="reg-email" type="email" required autoComplete="email"
+              className="site-input !pl-10"
+              value={form.email} onChange={set('email')} placeholder="you@example.com"
+            />
           </div>
+        </Field>
 
-          <button type="submit" disabled={loading}
-            className="btn-primary mt-1 w-full disabled:opacity-50">
-            {loading ? 'Creating account…' : 'Create Account'}
-          </button>
-        </form>
+        <Field label="Demat Broker" htmlFor="reg-broker">
+          <select
+            id="reg-broker" required className="site-input"
+            value={form.broker} onChange={set('broker')}
+          >
+            <option value="" disabled>Select your broker</option>
+            {BROKERS.map((b) => (
+              <option key={b.value} value={b.value}>{b.label}</option>
+            ))}
+          </select>
+        </Field>
 
-        <p className="mt-6 text-center text-sm text-slate-500">
-          Already have an account?{' '}
-          <Link to="/login" className="font-medium text-vega-blue hover:underline">Sign in</Link>
-        </p>
-        <p className="mt-2 text-center text-xs text-gray-600">
-          <Link to="/" className="hover:text-gray-400">← Back to site</Link>
-        </p>
-      </div>
-    </div>
-  );
-}
+        <Field label="Password" htmlFor="reg-password">
+          <div onBlur={() => setPasswordTouched(true)}>
+            <PasswordField
+              id="reg-password"
+              value={form.password}
+              onChange={set('password')}
+              placeholder="Create new password"
+              autoComplete="new-password"
+              minLength={PASSWORD_MIN}
+              invalid={passwordTouched && !!form.password && !passwordValid}
+              describedBy="reg-password-strength"
+            />
+          </div>
+          <PasswordStrength id="reg-password-strength" password={form.password} />
+        </Field>
 
-function Field({ label, children }) {
-  return (
-    <div>
-      <label className="mb-1 block text-xs font-medium text-slate-500">{label}</label>
-      {children}
-    </div>
+        <AuthError>{error}</AuthError>
+
+        <div className="rounded-xl border border-white/[0.08] bg-white/[0.03] px-4 py-3.5 text-xs leading-relaxed text-muted">
+          After registering, WhatsApp will open with a prefilled message to the
+          administrator. <span className="font-semibold text-text">Press Send</span> to
+          request approval — your account stays pending until it is approved.
+        </div>
+
+        <button
+          type="submit"
+          disabled={loading}
+          className="site-btn-primary w-full !py-3.5 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {loading ? 'Creating account…' : (
+            <>
+              Create Account <HiOutlineArrowRight size={17} />
+            </>
+          )}
+        </button>
+      </form>
+    </AuthShell>
   );
 }

@@ -143,6 +143,43 @@ CREATE TABLE IF NOT EXISTS login_history (
 ) ENGINE=InnoDB;
 
 -- ---------------------------------------------------
+-- PASSWORD RESETS
+--
+-- One row per reset request. Backs the "Forgot password?" flow.
+--
+-- WHAT IS STORED IS A HASH, NOT THE TOKEN. The random token only ever exists
+-- in the email that was sent; the column holds its SHA-256. So a leaked
+-- database dump cannot be used to reset anybody's password, exactly as a
+-- leaked dump cannot be used to log in as them (password_hash is bcrypt).
+-- CHAR(64) is the fixed width of a hex SHA-256.
+--
+-- `used_at` rather than a DELETE, so a token is single-use and the history of
+-- resets survives for audit. Rows are pruned by age, not by use.
+--
+-- ON DELETE CASCADE: a deleted user must not leave a live reset token behind
+-- that could be redeemed against a recycled id.
+-- ---------------------------------------------------
+CREATE TABLE IF NOT EXISTS password_resets (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  user_id BIGINT UNSIGNED NOT NULL,
+  token_hash CHAR(64) NOT NULL,
+  expires_at DATETIME NOT NULL,
+  used_at DATETIME DEFAULT NULL,
+  requested_ip VARCHAR(64) DEFAULT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  UNIQUE KEY uq_password_resets_token (token_hash),
+  INDEX idx_password_resets_user (user_id),
+  INDEX idx_password_resets_expires (expires_at)
+) ENGINE=InnoDB;
+
+-- Housekeeping. Expired and consumed tokens are worthless; keeping them
+-- forever only grows the table. Runs on every boot with the rest of this file.
+DELETE FROM password_resets
+ WHERE expires_at < (NOW() - INTERVAL 7 DAY)
+    OR (used_at IS NOT NULL AND used_at < (NOW() - INTERVAL 7 DAY));
+
+-- ---------------------------------------------------
 -- WATCHLISTS
 -- ---------------------------------------------------
 CREATE TABLE IF NOT EXISTS watchlists (

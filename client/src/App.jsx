@@ -7,6 +7,8 @@ import PricingPage from './site/pages/Pricing';
 import ContactPage from './site/pages/Contact';
 import Login from './pages/Login';
 import Register from './pages/Register';
+import ForgotPassword from './pages/ForgotPassword';
+import ResetPassword from './pages/ResetPassword';
 import PendingApproval from './pages/PendingApproval';
 import AdminLogin from './pages/AdminLogin';
 import Dashboard from './pages/Dashboard';
@@ -50,6 +52,19 @@ function AppRoutes() {
       <Route path="/login" element={<Login />} />
       <Route path="/register" element={<Register />} />
       <Route path="/pending-approval" element={<PendingApproval />} />
+      {/*
+        PASSWORD RESET — public by design.
+
+        Both screens must be reachable by someone who cannot sign in, which is
+        the entire premise, so neither sits behind ProtectedRoute. The security
+        boundary is the emailed token itself: /reset-password/:token is useless
+        without a token that is random, single-use, 30-minute-lived, and stored
+        server-side only as a SHA-256. Sitting outside the layouts for the same
+        reason Login and Register do — they are focused single-purpose screens,
+        not marketing pages.
+      */}
+      <Route path="/forgot-password" element={<ForgotPassword />} />
+      <Route path="/reset-password/:token" element={<ResetPassword />} />
       <Route path="/admin/login" element={<AdminLogin />} />
       <Route
         path="/dashboard"

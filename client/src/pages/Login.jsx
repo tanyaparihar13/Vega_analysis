@@ -1,17 +1,41 @@
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { HiOutlineMail, HiOutlineArrowRight } from 'react-icons/hi';
 import { useAuth } from '../context/AuthContext';
+import AuthShell, { Field, AuthError, AuthSuccess } from '../components/auth/AuthShell';
+import PasswordField from '../components/auth/PasswordField';
 
+/**
+ * Sign in.
+ *
+ * The authentication logic is unchanged: same `login()` call, same role-based
+ * destination, same error handling. What is new is the presentation, the
+ * show/hide password control and the route into the reset flow.
+ */
 export default function Login() {
   const { login } = useAuth();
   const navigate = useNavigate();
+  const { state } = useLocation();
   const [form, setForm] = useState({ email: '', password: '' });
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
+  /**
+   * ResetPassword sends the user here with a confirmation rather than signing
+   * them in, because approval and authentication are separate gates — a
+   * pending account can legitimately reset a forgotten password without that
+   * granting it a session.
+   *
+   * Held in state so it clears the moment the user starts a new attempt;
+   * leaving "password updated" on screen next to a failed login would be
+   * actively confusing.
+   */
+  const [notice, setNotice] = useState(state?.notice || '');
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
+    setNotice('');
     setBusy(true);
     try {
       /**
@@ -20,11 +44,6 @@ export default function Login() {
        * `login` returns the user, so the destination is decided from the fresh
        * response rather than from context state, which has not re-rendered yet
        * at this point in the handler.
-       *
-       * This used to send everyone to /dashboard, so an admin signing in
-       * through the public Login link landed on the trading dashboard and had
-       * to find the Admin Panel in the sidebar. The dedicated /admin/login
-       * screen already did this correctly; the two now agree.
        *
        * `replace` keeps the login screen out of the history stack — otherwise
        * Back from the dashboard returns to a form the user has already used.
@@ -39,56 +58,81 @@ export default function Login() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-vega-black bg-[radial-gradient(circle_at_top,_rgba(47,111,237,0.12),_transparent_55%)]">
-      <div className="glass-card w-full max-w-md p-8">
-        <div className="mb-8 text-center">
-          <h1 className="text-2xl font-bold text-slate-900 tracking-tight">
-            Vega <span className="text-vega-blue-light">Analysis</span>
-          </h1>
-          <p className="text-sm text-gray-400 mt-1">Professional Trading Terminal</p>
-        </div>
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="text-xs text-gray-400 mb-1 block">Email</label>
+    <AuthShell
+      title="Welcome back"
+      subtitle="Sign in to your Vega Analysis terminal."
+      footer={
+        <>
+          New here?{' '}
+          <Link to="/register" className="font-semibold text-primary hover:underline">
+            Open an account
+          </Link>
+        </>
+      }
+    >
+      <form onSubmit={handleSubmit} className="space-y-5">
+        <Field label="Email" htmlFor="login-email">
+          <div className="relative">
+            <HiOutlineMail
+              size={17}
+              className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-muted"
+              aria-hidden="true"
+            />
             <input
-              type="email" required className="input-dark w-full"
+              id="login-email"
+              type="email"
+              required
+              autoComplete="email"
+              className="site-input !pl-10"
               value={form.email}
               onChange={(e) => setForm({ ...form, email: e.target.value })}
               placeholder="you@example.com"
             />
           </div>
-          <div>
-            <label className="text-xs text-gray-400 mb-1 block">Password</label>
-            <input
-              type="password" required className="input-dark w-full"
-              value={form.password}
-              onChange={(e) => setForm({ ...form, password: e.target.value })}
-              placeholder="••••••••"
-            />
-          </div>
+        </Field>
 
-          {error && <p className="text-loss text-sm">{error}</p>}
+        <Field
+          label="Password"
+          htmlFor="login-password"
+          hint={
+            <Link
+              to="/forgot-password"
+              className="text-xs font-semibold text-primary transition-opacity hover:opacity-80"
+            >
+              Forgot password?
+            </Link>
+          }
+        >
+          <PasswordField
+            id="login-password"
+            value={form.password}
+            onChange={(e) => setForm({ ...form, password: e.target.value })}
+            placeholder="Enter your password"
+            autoComplete="current-password"
+          />
+        </Field>
 
-          <button type="submit" disabled={busy} className="btn-primary w-full mt-2 disabled:opacity-50">
-            {busy ? 'Signing in…' : 'Sign In'}
-          </button>
-        </form>
+        <AuthSuccess>{notice}</AuthSuccess>
+        <AuthError>{error}</AuthError>
 
-        <p className="text-sm text-gray-400 text-center mt-6">
-          New here?{' '}
-          <Link to="/register" className="text-vega-blue-light hover:underline">
-            Create an account
-          </Link>
-        </p>
-        {/* The public site is the front door now, so these screens need a way
-            back to it — otherwise a visitor who clicks Login is stranded. */}
-        <p className="text-xs text-gray-600 text-center mt-2">
-          <Link to="/" className="hover:text-gray-400">← Back to site</Link>
-          <span className="mx-2 text-gray-700">·</span>
-          <Link to="/admin/login" className="hover:text-gray-400">Admin login</Link>
-        </p>
-      </div>
-    </div>
+        <button
+          type="submit"
+          disabled={busy}
+          className="site-btn-primary w-full !py-3.5 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {busy ? 'Signing in…' : (
+            <>
+              Sign In <HiOutlineArrowRight size={17} />
+            </>
+          )}
+        </button>
+      </form>
+
+      <p className="mt-6 border-t border-white/[0.08] pt-5 text-center text-xs text-muted/70">
+        <Link to="/admin/login" className="transition-colors hover:text-primary">
+          Admin login
+        </Link>
+      </p>
+    </AuthShell>
   );
 }

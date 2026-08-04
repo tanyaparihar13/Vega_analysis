@@ -1,6 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
+import { motion } from 'framer-motion';
+import { FaWhatsapp } from 'react-icons/fa';
+import { HiOutlineClock } from 'react-icons/hi';
 import api from '../api/axios';
+import AuthShell from '../components/auth/AuthShell';
 
 /**
  * Shown immediately after registration.
@@ -9,6 +13,15 @@ import api from '../api/axios';
  * can silently swallow that, so the link is repeated here as an explicit
  * button. If the user navigated here directly (no router state), the link is
  * rebuilt from /api/auth/config so the page is never a dead end.
+ *
+ * THE FALLBACK MESSAGE MIRRORS THE SERVER'S. `buildWhatsAppUrl` in
+ * authController.js is the canonical version; this rebuild has to carry the
+ * same fields — including User ID and Account Type — or an admin receiving the
+ * fallback would get a thinner message than one receiving the real thing and
+ * have no way to tell which they were looking at.
+ *
+ * NO PASSWORD IS EVER PUT IN THIS MESSAGE, here or on the server. It is
+ * bcrypt-hashed at registration and never exists in plaintext afterwards.
  */
 export default function PendingApproval() {
   const { state } = useLocation();
@@ -18,6 +31,8 @@ export default function PendingApproval() {
   const email = state?.email;
   const mobile = state?.mobile;
   const broker = state?.broker;
+  const userId = state?.userId;
+  const accountType = state?.accountType;
 
   useEffect(() => {
     if (state?.whatsappUrl) return;
@@ -30,74 +45,89 @@ export default function PendingApproval() {
           (email ? `\nEmail: ${email}` : '') +
           (mobile ? `\nMobile: ${mobile}` : '') +
           (broker ? `\nDemat Broker: ${broker}` : '') +
+          (userId ? `\nUser ID: ${userId}` : '') +
+          (accountType ? `\nAccount Type: ${accountType}` : '') +
           '\n\nStatus: Pending approval';
         setFallbackUrl(`https://wa.me/${data.adminWhatsappNumber}?text=${encodeURIComponent(text)}`);
       })
       .catch(() => setFallbackUrl(null));
-  }, [state, name, email, mobile, broker]);
+  }, [state, name, email, mobile, broker, userId, accountType]);
 
   const whatsappUrl = state?.whatsappUrl || fallbackUrl;
+  const hasDetails = name || email || mobile || broker || userId || accountType;
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-vega-black px-4 py-10">
-      <div className="glass-card w-full max-w-lg p-8 text-center">
-        <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-vega-amber/10 text-2xl">
-          ⏳
-        </div>
-
-        <h1 className="text-xl font-semibold text-slate-900">Registration received</h1>
-        <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-slate-500">
-          Your account is <span className="font-medium text-vega-amber">pending approval</span>.
-          An administrator must approve it before you can sign in.
+    <AuthShell
+      title="Registration received"
+      subtitle="An administrator must approve your account before you can sign in."
+      width="max-w-lg"
+      footer={
+        <Link to="/login" className="font-semibold text-primary hover:underline">
+          Already approved? Sign in →
+        </Link>
+      }
+    >
+      <motion.div
+        initial={{ opacity: 0, scale: 0.94 }}
+        animate={{ opacity: 1, scale: 1 }}
+        transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
+        className="flex flex-col items-center"
+      >
+        <span className="grid h-16 w-16 place-items-center rounded-2xl border border-gold/25 bg-gold/10 text-gold">
+          <HiOutlineClock size={30} />
+        </span>
+        <p className="mt-5 text-center text-sm leading-relaxed text-muted">
+          Your account is{' '}
+          <span className="font-semibold text-gold">pending approval</span>.
         </p>
+      </motion.div>
 
-        {(name || email || mobile || broker) && (
-          <div className="mx-auto mt-5 max-w-xs space-y-1.5 rounded-lg border border-vega-border bg-slate-50 px-4 py-3 text-left text-xs">
-            {name && <Row label="Name" value={name} />}
-            {email && <Row label="Email" value={email} />}
-            {mobile && <Row label="Mobile" value={mobile} />}
-            {broker && <Row label="Broker" value={broker} />}
-          </div>
-        )}
+      {hasDetails && (
+        <div className="mt-7 space-y-2.5 rounded-xl border border-white/[0.08] bg-white/[0.03] px-5 py-4">
+          {name && <Row label="Name" value={name} />}
+          {email && <Row label="Email" value={email} />}
+          {mobile && <Row label="Mobile" value={mobile} />}
+          {broker && <Row label="Broker" value={broker} />}
+          {userId && <Row label="User ID" value={String(userId)} />}
+          {accountType && <Row label="Account Type" value={accountType} />}
+        </div>
+      )}
 
-        <div className="mt-6 space-y-3">
-          {whatsappUrl ? (
-            <>
-              <a
-                href={whatsappUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-[#25D366] px-4 py-2.5 font-medium text-white transition-opacity hover:opacity-90"
-              >
-                Open WhatsApp and send the request
-              </a>
-              <p className="text-xs text-slate-400">
-                WhatsApp should have opened automatically. If it did not, use the
-                button above — then press <span className="font-medium text-slate-600">Send</span>.
-              </p>
-            </>
-          ) : (
-            <p className="text-xs text-slate-400">
-              Contact the administrator to have your account approved.
+      <div className="mt-7 space-y-3">
+        {whatsappUrl ? (
+          <>
+            <a
+              href={whatsappUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="site-tap-clean inline-flex w-full items-center justify-center gap-2.5 rounded-xl px-5 py-3.5 font-body font-semibold text-white transition-all duration-300 hover:-translate-y-0.5"
+              style={{
+                backgroundColor: '#25D366',
+                boxShadow: '0 10px 30px -10px rgba(37,211,102,0.85)',
+              }}
+            >
+              <FaWhatsapp size={20} /> Open WhatsApp and send the request
+            </a>
+            <p className="text-center text-xs leading-relaxed text-muted/80">
+              WhatsApp should have opened automatically. If it did not, use the button
+              above — then press <span className="font-semibold text-text">Send</span>.
             </p>
-          )}
-        </div>
-
-        <div className="mt-7 border-t border-vega-border pt-5">
-          <Link to="/login" className="text-sm font-medium text-vega-blue hover:underline">
-            Already approved? Sign in →
-          </Link>
-        </div>
+          </>
+        ) : (
+          <p className="text-center text-xs text-muted/80">
+            Contact the administrator to have your account approved.
+          </p>
+        )}
       </div>
-    </div>
+    </AuthShell>
   );
 }
 
 function Row({ label, value }) {
   return (
-    <div className="flex justify-between gap-3">
-      <span className="text-slate-400">{label}</span>
-      <span className="truncate font-medium text-slate-700">{value}</span>
+    <div className="flex items-baseline justify-between gap-4 text-xs">
+      <span className="shrink-0 text-muted">{label}</span>
+      <span className="truncate font-medium text-text">{value}</span>
     </div>
   );
 }

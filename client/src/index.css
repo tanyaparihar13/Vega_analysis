@@ -475,6 +475,23 @@
     caret-color: theme('colors.text');
   }
 
+  /*
+    Show/hide password toggle.
+
+    Mirrors the `.btn-icon` rule in the app's own component layer above: 36px is
+    a comfortable mouse target and an uncomfortable thumb one, so it grows to
+    the 44px Apple/Material minimum on touch. Kept as its own class rather than
+    reusing `.btn-icon`, which carries the light terminal's colours.
+  */
+  .site-eye-toggle {
+    @apply grid h-9 w-9 place-items-center rounded-lg text-muted transition-colors
+           hover:text-primary;
+  }
+  .site-eye-toggle:hover { background-color: rgba(255, 255, 255, 0.06); }
+  @media (pointer: coarse) {
+    .site-eye-toggle { @apply h-11 w-11; }
+  }
+
   /* ---- Ticker ---------------------------------------------------------- */
 
   /*
