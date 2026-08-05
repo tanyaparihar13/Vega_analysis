@@ -309,11 +309,15 @@ function UnlockCard({ to, signedIn }) {
           <span className="text-[11px] font-bold uppercase tracking-[0.16em] text-primary">
             Live access
           </span>
+         
         </div>
-
+ <span className="text-[11px] font-bold uppercase tracking-[0.16em] text-primary">
+            30 Minutes Delayed Data
+          </span>
         <h4 className="mt-3 font-display text-lg font-bold leading-snug text-text">
           Unlock Live Vega Analysis
         </h4>
+        
         <p className="mt-2 text-sm leading-relaxed text-muted">
           Get real-time Vega charts, option analytics, and instant market updates.
         </p>

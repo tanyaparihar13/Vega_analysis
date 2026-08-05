@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { createChart, ColorType, LineStyle, CrosshairMode } from 'lightweight-charts';
+import { createChart, ColorType, LineStyle, LineType, CrosshairMode } from 'lightweight-charts';
 
 /**
  * Vega Analysis chart — on TradingView's lightweight-charts.
@@ -25,23 +25,50 @@ import { createChart, ColorType, LineStyle, CrosshairMode } from 'lightweight-ch
 export const SERIES_COLORS = {
   call: '#0f7a46',
   put: '#c62828',
-  diff: '#41527a',
+  diff: '#5b5f97',   // purple-grey, per the reference platforms' Difference line
+};
+
+/**
+ * Fill gradients for the two vega areas (parity item 2).
+ *
+ * lightweight-charts' area series fills from the line down to the bottom of the
+ * pane, not to zero, so the alpha has to stay low: at anything heavier the two
+ * fills stack into an opaque block wherever the curves cross, and the
+ * Difference line — the series a trader is actually reading — disappears
+ * underneath them. These values keep both areas legible while they overlap.
+ */
+const SERIES_FILL = {
+  call: { top: 'rgba(15,122,70,0.26)', bottom: 'rgba(15,122,70,0.02)' },
+  put: { top: 'rgba(198,40,40,0.24)', bottom: 'rgba(198,40,40,0.02)' },
 };
 
 const AXIS_TEXT = '#5a6a85';
 const GRID_LINE = 'rgba(15,23,42,0.07)';
 const AXIS_LINE = 'rgba(15,23,42,0.16)';
 
-const IST_TIME = new Intl.DateTimeFormat('en-IN', {
+const IST_HM = new Intl.DateTimeFormat('en-GB', {
   hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Kolkata',
+});
+const IST_HMS = new Intl.DateTimeFormat('en-GB', {
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  hour12: false, timeZone: 'Asia/Kolkata',
 });
 
 /**
  * lightweight-charts renders timestamps in UTC. Our points are UNIX seconds and
  * the market is IST, so every axis label and crosshair readout is formatted
  * explicitly in Asia/Kolkata — otherwise a 09:16 sample shows as 03:46.
+ *
+ * SECONDS (parity item 7): on a 5s/10s/15s/30s chart, HH:MM is not a label, it
+ * is a collision — twelve consecutive points all reading "09:15" with no way to
+ * tell them apart, and a tooltip that cannot be matched to a table row. The
+ * `withSeconds` flag is threaded from the selected timeframe rather than
+ * inferred from the data, so the axis, the crosshair, the latest-value readout
+ * and the tooltip all switch together and can never show different precisions
+ * for the same point.
  */
-const fmtIst = (unixSeconds) => IST_TIME.format(new Date(unixSeconds * 1000));
+const fmtIstAt = (unixSeconds, withSeconds) =>
+  (withSeconds ? IST_HMS : IST_HM).format(new Date(unixSeconds * 1000));
 const fmtNum = (v) => (v == null || Number.isNaN(Number(v)) ? '–' : Number(v).toFixed(2));
 
 /**
@@ -89,11 +116,25 @@ const fmtStrike = (v) => {
   return Number.isInteger(n) ? n.toLocaleString('en-IN') : n.toFixed(2);
 };
 
-function VegaChart({ points, visible = {}, loading = false, emptyLabel, onHoverPoint, instrument }) {
+function VegaChart({
+  points, visible = {}, loading = false, emptyLabel, onHoverPoint, instrument,
+  showSeconds = false,
+}) {
   const wrapRef = useRef(null);
   const containerRef = useRef(null);
   const chartRef = useRef(null);
   const seriesRef = useRef({ call: null, put: null, diff: null });
+
+  /**
+   * The chart's time formatters are installed once, at creation, and closing
+   * over `showSeconds` directly would mean a timeframe change could only take
+   * effect by tearing the whole chart down and rebuilding it — losing the zoom,
+   * the data and a frame. Reading a ref inside the formatter keeps the chart
+   * alive; the effect below nudges it to repaint with the new precision.
+   */
+  const showSecondsRef = useRef(showSeconds);
+  showSecondsRef.current = showSeconds;
+  const fmtIst = useCallback((t) => fmtIstAt(t, showSecondsRef.current), []);
 
   // One piece of state for both dimensions, so a single commit-time effect can
   // resize the chart. Splitting them meant a width-only change (sidebar
@@ -205,7 +246,10 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel, onHoverP
       timeScale: {
         borderColor: AXIS_LINE,
         timeVisible: true,
-        secondsVisible: false,
+        // Kept in step with the selected timeframe by the effect below. The
+        // library uses this to decide tick DENSITY; the label text itself always
+        // comes from tickMarkFormatter.
+        secondsVisible: showSecondsRef.current,
         rightOffset: 4,
         // Stops the axis cramming labels together on a narrow phone.
         minBarSpacing: 0.5,
@@ -221,33 +265,76 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel, onHoverP
       handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: true },
     });
 
+    /**
+     * Shared series options (parity item 2).
+     *
+     *   lastValueVisible  the value tag on the RIGHT price axis — the
+     *                     "right-side value labels" the reference platforms
+     *                     carry, so the current number is readable without
+     *                     hovering.
+     *   priceLineVisible  the horizontal dashed line + tag tracking the LAST
+     *                     point. Previously off, which is what left the chart
+     *                     with no last-value marker at all.
+     *   lineType Curved   the smooth curve. A 5s series is dense enough that
+     *                     straight segments read as noise; curving them is what
+     *                     makes the shape comparable to StockMojo's.
+     */
     const common = {
       lineWidth: 2,
-      priceLineVisible: false,
+      priceLineVisible: true,
+      priceLineWidth: 1,
+      priceLineStyle: LineStyle.Dotted,
       lastValueVisible: true,
+      crosshairMarkerVisible: true,
       crosshairMarkerRadius: 4,
       crosshairMarkerBorderWidth: 2,
       crosshairMarkerBorderColor: '#ffffff',
-      lineType: 0,
+      lineType: LineType.Curved,
     };
 
+    /**
+     * Call and Put are AREA series, Difference stays a LINE.
+     *
+     * That is the reference platforms' visual grammar and it carries meaning:
+     * the two filled bands are the quantities being compared, and the line
+     * running between them is the comparison. Making all three lines (as this
+     * did) left the eye no way to tell the subject from the derived measure.
+     *
+     * The Difference deliberately keeps a solid, slightly heavier stroke rather
+     * than the old dashes — it is the primary signal and a dashed line reads as
+     * secondary.
+     */
     seriesRef.current = {
-      call: chart.addLineSeries({ ...common, color: SERIES_COLORS.call, title: 'Call Vega' }),
-      put: chart.addLineSeries({ ...common, color: SERIES_COLORS.put, title: 'Put Vega' }),
+      call: chart.addAreaSeries({
+        ...common,
+        lineColor: SERIES_COLORS.call,
+        topColor: SERIES_FILL.call.top,
+        bottomColor: SERIES_FILL.call.bottom,
+        title: 'Call Vega',
+      }),
+      put: chart.addAreaSeries({
+        ...common,
+        lineColor: SERIES_COLORS.put,
+        topColor: SERIES_FILL.put.top,
+        bottomColor: SERIES_FILL.put.bottom,
+        title: 'Put Vega',
+      }),
       diff: chart.addLineSeries({
         ...common, color: SERIES_COLORS.diff, lineWidth: 2,
-        lineStyle: LineStyle.Dashed, title: 'Difference',
+        title: 'Difference',
       }),
     };
 
     // Everything is a deviation from the day-open baseline, so zero is the
-    // reference that matters — draw it on the Call series' scale.
+    // reference that matters — draw it on the Call series' scale. `axisLabelVisible`
+    // is on now so the baseline is identifiable on the price axis too, rather
+    // than being an anonymous dotted rule.
     seriesRef.current.call.createPriceLine({
       price: 0,
-      color: 'rgba(15,23,42,0.42)',
+      color: 'rgba(15,23,42,0.55)',
       lineWidth: 1,
-      lineStyle: LineStyle.Dotted,
-      axisLabelVisible: false,
+      lineStyle: LineStyle.Dashed,
+      axisLabelVisible: true,
       title: '',
     });
 
@@ -294,7 +381,20 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel, onHoverP
       lastHoverTimeRef.current = null;
       onHoverPointRef.current?.(null);
     };
-  }, [emitHover]);
+  }, [emitHover, fmtIst]);
+
+  /**
+   * Switch the axis between minute and second precision (parity item 7).
+   *
+   * The formatters read `showSecondsRef`, so all this has to do is tell the
+   * library the precision changed — applyOptions forces the time scale to
+   * recompute its tick marks, which re-runs tickMarkFormatter against the new
+   * value. Without the applyOptions the ref would be updated but the already-
+   * rendered labels would sit there stale until the next data change.
+   */
+  useEffect(() => {
+    chartRef.current?.applyOptions({ timeScale: { secondsVisible: showSeconds } });
+  }, [showSeconds]);
 
   /**
    * The single resize point.
@@ -443,6 +543,7 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel, onHoverP
           diff={hover.diff ?? hoverPoint?.vegaDiff}
           trend={hoverPoint?.trend}
           trendColor={hoverPoint?.trendColor}
+          showSeconds={showSeconds}
           x={hover.x}
           y={hover.y}
           boxWidth={size.width}
@@ -493,7 +594,7 @@ function VegaChart({ points, visible = {}, loading = false, emptyLabel, onHoverP
  */
 function ChartTooltip({
   time, instrument, expiry, strike, call, put, diff, trend, trendColor,
-  x, y, boxWidth, boxHeight,
+  showSeconds, x, y, boxWidth, boxHeight,
 }) {
   const width = boxWidth || 0;
   const height = boxHeight || 0;
@@ -523,7 +624,7 @@ function ChartTooltip({
           atm_strike column has no strike to report, and an empty row is more
           honest than "Strike –". */}
       <div className="space-y-0.5 border-b border-vega-border pb-1.5">
-        <MetaRow label="Time" value={fmtIst(time)} strong />
+        <MetaRow label="Time" value={fmtIstAt(time, showSeconds)} strong />
         {instrument && <MetaRow label="Instrument" value={instrument} strong />}
         {expiryText && <MetaRow label="Expiry" value={expiryText} />}
         {strikeText && <MetaRow label="Strike" value={strikeText} />}

@@ -26,6 +26,19 @@ const { TREND } = require('../config/vegaConfig');
  *   Any case with an exact zero on a side (no directional signal) -> Neutral.
  *
  * Returns a { key, label, color } object from vegaConfig.TREND.
+ *
+ * ---------------------------------------------------------------------------
+ * ALWAYS PASS THE *STORED* DIFFS, NEVER THE DISPLAY-SIGNED ONES.
+ *
+ * vegaConfig.DISPLAY_SIGN negates the three series on the way out so they match
+ * StockMojo / Alpha Edge (see vegaTimeseriesService.decorate). The rules below
+ * are stated in the ENGINE's convention, where "calls gaining vega while puts
+ * lose it" is a rally and therefore Bullish. Handing this function the flipped
+ * pair would relabel every rally as Bearish — the opposite of trend parity.
+ *
+ * decorate() is the only caller and it classifies before flipping. Keep it that
+ * way; a second caller that flips first would silently invert every label.
+ * ---------------------------------------------------------------------------
  */
 function classifyTrend(callVegaDiff, putVegaDiff) {
   const call = Number(callVegaDiff);

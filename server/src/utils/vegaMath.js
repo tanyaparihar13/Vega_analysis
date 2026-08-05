@@ -110,6 +110,62 @@ function indexByStrike(chain) {
 }
 
 /**
+ * STABLE MODE (parity item 6) — the day-open basket, with a hysteresis exit.
+ *
+ * The problem with 'dynamic' is not that it is wrong; it is that it changes the
+ * QUESTION every sample. Recomputing the [start, deltaMax] band from the current
+ * chain means a strike whose delta wanders across a boundary is added to (or
+ * removed from) the sum between one tick and the next, and a whole contract's
+ * vega enters or leaves the total in one step. Around ATM, where deltas move
+ * fastest and vega is largest, that produces a per-tick sawtooth that is an
+ * artefact of the selection rather than a move in the market.
+ *
+ * Stable mode fixes the basket at what was eligible AT DAY-OPEN, so the sums are
+ * measured on the SAME contracts all session and the curve reflects vega
+ * actually changing. The one thing it still has to handle is a genuine trend: if
+ * the underlying runs far enough that a strike is now deep ITM, keeping it makes
+ * the total meaningless. So a strike is retained only while its CURRENT delta is
+ * inside the band widened by `hysteresis` at both ends, and dropped once it
+ * leaves. The margin is what stops a strike sitting on the boundary from
+ * flickering — which would reintroduce exactly the noise being removed.
+ *
+ * Nothing is ever ADMITTED mid-session. Admission is what makes a basket
+ * unstable, and the day-open basket is the reference the whole calculation is
+ * defined against.
+ *
+ * @param {Array}    currentChain  rows as built this sample
+ * @param {number[]} openStrikes   the day-open eligible list for ONE side
+ * @param {'call'|'put'} side
+ * @param {number}   start         delta floor
+ * @param {number}   deltaMax      delta ceiling
+ * @param {number}   hysteresis    margin added to both ends, for RETENTION only
+ * @returns {number[]} the surviving strikes, normalized to Number keys
+ */
+function retainStable(currentChain, openStrikes, side, start, deltaMax, hysteresis = 0) {
+  const cur = indexByStrike(currentChain);
+  const lo = Math.max(0, start - hysteresis);
+  const hi = deltaMax + hysteresis;
+
+  const out = [];
+  for (const raw of openStrikes || []) {
+    const k = strikeKey(raw);
+    const row = cur.get(k);
+    // A strike that is not on today's board at all cannot be evaluated here. It
+    // is removed by the present-in-both guard in computePoint anyway, so keeping
+    // it costs nothing and avoids a second, differently-behaved filter.
+    if (!row) { out.push(k); continue; }
+    const d = row[side]?.delta;
+    // An unsolvable delta is not evidence that the strike has left the band.
+    // Keep it — the vega guard in computePoint will skip it for this sample if
+    // its vega is unusable too, which is the correct, narrower response.
+    if (d == null || !Number.isFinite(Number(d))) { out.push(k); continue; }
+    const abs = Math.abs(Number(d));
+    if (abs >= lo && abs <= hi) out.push(k);
+  }
+  return out;
+}
+
+/**
  * The whole calculation for one minute.
  *
  * @param {object}   args
@@ -117,12 +173,16 @@ function indexByStrike(chain) {
  * @param {Array}    args.openChain      day-open chain rows, same shape
  * @param {number}   args.start          per-underlying delta floor
  * @param {number}   args.deltaMax       delta ceiling (0.6)
- * @param {'dynamic'|'frozen'} args.mode
+ * @param {'stable'|'dynamic'|'frozen'} args.mode
  * @param {{callStrikes:number[], putStrikes:number[]}} [args.frozenStrikes]
- *        required when mode === 'frozen'
+ *        required when mode === 'frozen' or 'stable'
+ * @param {number} [args.hysteresis] retention margin for 'stable'
  * @returns full point payload (diffs, totals, strike lists + counts)
  */
-function computePoint({ currentChain, openChain, start, deltaMax, mode = 'dynamic', frozenStrikes = null }) {
+function computePoint({
+  currentChain, openChain, start, deltaMax,
+  mode = 'dynamic', frozenStrikes = null, hysteresis = 0,
+}) {
   const curMap = indexByStrike(currentChain);
   const openMap = indexByStrike(openChain);
 
@@ -131,8 +191,14 @@ function computePoint({ currentChain, openChain, start, deltaMax, mode = 'dynami
   if (mode === 'frozen' && frozenStrikes) {
     callStrikes = (frozenStrikes.callStrikes || []).map(strikeKey);
     putStrikes = (frozenStrikes.putStrikes || []).map(strikeKey);
+  } else if (mode === 'stable' && frozenStrikes) {
+    // Day-open basket + hysteresis exit. See retainStable().
+    callStrikes = retainStable(currentChain, frozenStrikes.callStrikes, 'call', start, deltaMax, hysteresis);
+    putStrikes = retainStable(currentChain, frozenStrikes.putStrikes, 'put', start, deltaMax, hysteresis);
   } else {
-    // DYNAMIC (default): recompute the band from the CURRENT chain each call.
+    // DYNAMIC: recompute the band from the CURRENT chain each call (addvega.php
+    // literal). Also the fallback when a stable/frozen run has no day-open
+    // basket yet — better a noisier point than no point at all.
     ({ callStrikes, putStrikes } = pickStrikes(currentChain, start, deltaMax));
   }
 
@@ -183,4 +249,6 @@ function computePoint({ currentChain, openChain, start, deltaMax, mode = 'dynami
   };
 }
 
-module.exports = { passes, pickStrikes, computePoint, indexByStrike, round, num, isReal };
+module.exports = {
+  passes, pickStrikes, retainStable, computePoint, indexByStrike, round, num, isReal,
+};

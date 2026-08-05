@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   TbChevronLeft, TbChevronRight, TbCalendarStats, TbRefresh,
   TbDatabase, TbBroadcast, TbClockHour4, TbChevronDown, TbCalendarTime,
+  TbFileSpreadsheet,
 } from 'react-icons/tb';
 import api from '../../api/axios';
+import { downloadBlob } from '../../utils/download';
 import VegaChart, { SERIES_COLORS } from './VegaChart';
 import InstrumentSelector from './InstrumentSelector';
 import useVegaStream from './useVegaStream';
@@ -59,6 +61,31 @@ import useVegaStream from './useVegaStream';
 const POLL_MS = 60_000;
 
 /**
+ * Last-resort instrument list.
+ *
+ * /vega/instruments answers 503 until the instrument master is loaded, which is
+ * the normal state of a fresh install and of any morning before an admin has
+ * connected Zerodha. Before the selector existed these five were hardcoded, so
+ * the page always had something to select; driving the UI purely from the
+ * endpoint reintroduced a state where NOTHING is selectable and the page looks
+ * broken rather than merely unconfigured.
+ *
+ * These five are the curated indices from the server's own constants table —
+ * they cannot change without a code change — so hardcoding them as a fallback
+ * is safe in a way that hardcoding stock names would not be.
+ */
+const FALLBACK_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'SENSEX'].map((symbol) => ({
+  symbol,
+  label: symbol,
+  category: 'index',
+  exchange: symbol === 'SENSEX' ? 'BFO' : 'NFO',
+  lotSize: null,
+  strikeStep: null,
+  recorded: true,
+  resolution: '5s',
+}));
+
+/**
  * Timeframes, grouped the way a desk says them.
  *
  * Seconds tiers only have history where the recorder stores 5s rows (indices);
@@ -91,12 +118,33 @@ const fmtSigned = (v, dp = 2) => {
   return `${n > 0 ? '+' : ''}${n.toFixed(dp)}`;
 };
 
-const fmtTime = (unixSeconds) =>
+/**
+ * Clock formatting, IST (parity item 7).
+ *
+ * `withSeconds` is driven by the SELECTED TIMEFRAME, not by the data. On a
+ * 5s/10s/15s/30s series the minute-only format collapses twelve distinct rows
+ * into twelve rows all reading "09:15" — the table stops being readable and, more
+ * importantly, stops being matchable against the chart's crosshair. The chart is
+ * given the same flag, so the two always print a point's time identically.
+ *
+ * Rounding is never applied: the timestamp shown is the point's own bucket start,
+ * to the second, exactly as recorded.
+ */
+const IST_HM = new Intl.DateTimeFormat('en-GB', {
+  hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Kolkata',
+});
+const IST_HMS = new Intl.DateTimeFormat('en-GB', {
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  hour12: false, timeZone: 'Asia/Kolkata',
+});
+
+const fmtTime = (unixSeconds, withSeconds = false) =>
   unixSeconds == null
     ? '–'
-    : new Date(unixSeconds * 1000).toLocaleTimeString('en-IN', {
-        hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'Asia/Kolkata',
-      });
+    : (withSeconds ? IST_HMS : IST_HM).format(new Date(unixSeconds * 1000));
+
+/** True for the 5s/10s/15s/30s tiers — the ones whose rows differ within a minute. */
+const isSecondsTimeframe = (tf) => /s$/.test(String(tf || ''));
 
 /** ISO (YYYY-MM-DD) -> the DD-MM-YYYY the desk actually reads. */
 const fmtDate = (iso) => {
@@ -568,6 +616,9 @@ export default function VegaAnalysis() {
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [visible, setVisible] = useState({ call: true, put: true, diff: true });
+  // Excel export state. `error` is reused for failures so there is one place a
+  // user looks for "something went wrong on this page".
+  const [exporting, setExporting] = useState(false);
   // The point under the chart crosshair, so the matching table row can light
   // up. Time only — the values are already in `points`, and duplicating them
   // here is how a chart and a table drift apart.
@@ -613,6 +664,18 @@ export default function VegaAnalysis() {
       });
     return () => { cancelled = true; };
   }, []);
+
+  /**
+   * The lists the UI actually renders.
+   *
+   * Falls back to the five curated indices whenever the endpoint returned none
+   * — 503 before Zerodha is connected, a network failure, an empty payload — so
+   * the page is never left with an empty selector and no way to pick anything.
+   * The `error` is still surfaced inside the dropdown; this only guarantees
+   * there is something to choose while it is shown.
+   */
+  const availableIndices = catalogue.indices.length ? catalogue.indices : FALLBACK_INDICES;
+  const availableStocks = catalogue.stocks;
 
   // ---- live stream (today only) -----------------------------------------
   /**
@@ -740,6 +803,41 @@ export default function VegaAnalysis() {
   const latest = points.length ? points[points.length - 1] : null;
   const tableRows = useMemo(() => [...points].reverse(), [points]); // newest first
 
+  // One flag, read by the chart AND the table, so a point's timestamp is printed
+  // to the same precision in both places.
+  const showSeconds = isSecondsTimeframe(timeframe);
+
+  /**
+   * Excel export (parity item 10).
+   *
+   * The server rebuilds the rows from the same loadByDate() the chart was filled
+   * from, so the file matches what is on screen — including the display sign
+   * convention, which the raw database columns do not carry. Exporting from
+   * `points` in the browser would work too, but it would silently diverge the
+   * moment the chart is showing the live socket tail and the user has scrolled
+   * the table, so the selection is sent instead of the data.
+   *
+   * Auth is a bearer token in localStorage attached by the axios interceptor, so
+   * this cannot be a plain <a download> — hence the blob round trip.
+   */
+  const exportExcel = useCallback(async () => {
+    setExporting(true);
+    try {
+      // Exactly the parameters the series request used, so "the currently viewed
+      // data" is not an approximation — an omitted expiry resolves to the same
+      // nearest contract on both endpoints.
+      const res = await api.get(`/vega/${symbol}/export`, {
+        params: { timeframe, date, ...(expiry ? { expiry } : {}) },
+        responseType: 'blob',
+      });
+      downloadBlob(res.data, `vega_${symbol}_${expiry || date}_${timeframe}_${date}.xlsx`);
+    } catch {
+      setError('Could not build the Excel export for this selection');
+    } finally {
+      setExporting(false);
+    }
+  }, [symbol, timeframe, date, expiry]);
+
   const toggle = (key) => setVisible((v) => ({ ...v, [key]: !v[key] }));
 
   const selectSymbol = useCallback((s) => {
@@ -748,8 +846,8 @@ export default function VegaAnalysis() {
   }, [today]);
 
   const selectedInstrument = useMemo(
-    () => [...catalogue.indices, ...catalogue.stocks].find((i) => i.symbol === symbol) || null,
-    [catalogue, symbol]
+    () => [...availableIndices, ...availableStocks].find((i) => i.symbol === symbol) || null,
+    [availableIndices, availableStocks, symbol]
   );
 
   /**
@@ -828,8 +926,8 @@ export default function VegaAnalysis() {
           F&O names. Both write the same `symbol` state. */}
       <div className="flex flex-wrap items-center gap-2">
         <InstrumentSelector
-          indices={catalogue.indices}
-          stocks={catalogue.stocks}
+          indices={availableIndices}
+          stocks={availableStocks}
           value={symbol}
           onChange={selectSymbol}
           loading={catalogue.loading}
@@ -837,7 +935,7 @@ export default function VegaAnalysis() {
         />
 
         <div className="scroll-thin -mx-3 flex gap-2 overflow-x-auto px-3 pb-1 sm:mx-0 sm:flex-wrap sm:px-0 sm:pb-0">
-          {catalogue.indices.map((i) => (
+          {availableIndices.map((i) => (
             <button
               key={i.symbol}
               onClick={() => selectSymbol(i.symbol)}
@@ -890,6 +988,20 @@ export default function VegaAnalysis() {
             onChange={selectExpiry}
             loading={loading}
           />
+
+          {/* Downloads exactly what the chart and the table are showing: the
+              selected instrument, expiry, timeframe and date. */}
+          <button
+            onClick={exportExcel}
+            disabled={exporting || !points.length}
+            className="btn-secondary px-3 py-2 text-xs"
+            title={points.length
+              ? `Download ${points.length} row${points.length === 1 ? '' : 's'} as Excel (.xlsx)`
+              : 'Nothing to export for this selection yet'}
+          >
+            <TbFileSpreadsheet size={16} />
+            <span className="hidden sm:inline">{exporting ? 'Preparing…' : 'Excel'}</span>
+          </button>
         </div>
       </div>
 
@@ -905,7 +1017,7 @@ export default function VegaAnalysis() {
         />
         <SummaryTile
           label="Difference" tone="diff" signed value={latest?.vegaDiff}
-          sub={latest ? `As of ${fmtTime(latest.time)} IST` : 'Awaiting data'}
+          sub={latest ? `As of ${fmtTime(latest.time, showSeconds)} IST` : 'Awaiting data'}
         />
         <TrendTile latest={latest} count={points.length} />
       </div>
@@ -1018,6 +1130,7 @@ export default function VegaAnalysis() {
                 emptyLabel={error ? null : emptyMessage}
                 onHoverPoint={setHoverTime}
                 instrument={symbol}
+                showSeconds={showSeconds}
               />
             </div>
           </section>
@@ -1070,7 +1183,9 @@ export default function VegaAnalysis() {
                   // confirmation that the tooltip and the table are reading the
                   // identical record — not a second copy of the numbers.
                   <tr key={p.time} className={p.time === hoverTime ? 'row-linked' : undefined}>
-                    <td className="num font-semibold text-ink-700">{fmtTime(p.time)}</td>
+                    {/* Seconds are shown verbatim on a seconds timeframe —
+                        09:15:05, 09:15:10, … — never rounded to the minute. */}
+                    <td className="num font-semibold text-ink-700">{fmtTime(p.time, showSeconds)}</td>
                     <td className={`text-right ${p.callVegaDiff >= 0 ? 'val-up' : 'val-down'}`}>
                       {fmt(p.callVegaDiff)}
                     </td>

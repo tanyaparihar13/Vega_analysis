@@ -150,8 +150,33 @@ function stateKey(symbol, expiry) {
   return `${String(symbol).toUpperCase()}|${expiryKey(expiry)}`;
 }
 
+/**
+ * The delta FLOOR for one underlying (parity item 5).
+ *
+ * Curated indices keep their per-name floors from cfg.DELTA_START, unchanged.
+ * Everything else is an F&O stock and gets cfg.STOCK_START (0.20), so stocks run
+ * the 0.20-0.60 band StockMojo / Alpha Edge use rather than falling through to
+ * the index default of 0.05 and dragging a tail of illiquid far-OTM strikes into
+ * both sums.
+ *
+ * One value, used for the Call sum, the Put sum and therefore the Difference —
+ * they all come out of a single computePoint() call, so the three can never be
+ * filtered differently.
+ */
 function startFor(symbol) {
-  return cfg.DELTA_START[String(symbol || '').toUpperCase()] ?? cfg.DEFAULT_START;
+  const key = String(symbol || '').toUpperCase();
+  if (cfg.DELTA_START[key] != null) return cfg.DELTA_START[key];
+  return isIndex(key) ? cfg.DEFAULT_START : cfg.STOCK_START;
+}
+
+/** Strikes either side of ATM to build/subscribe. Stocks use a tighter board. */
+function strikeWindowFor(symbol) {
+  return isIndex(symbol) ? cfg.STRIKE_WINDOW : cfg.STOCK_STRIKE_WINDOW;
+}
+
+/** How many expiries to track. Stock options are monthly — one is the front month. */
+function expiryCountFor(symbol) {
+  return isIndex(symbol) ? cfg.EXPIRY_COUNT : cfg.STOCK_EXPIRY_COUNT;
 }
 
 /**
@@ -168,7 +193,7 @@ function trackedExpiries(symbol) {
   return instrumentService.getExpiries(c.key)
     .map(expiryKey)
     .filter(Boolean)
-    .slice(0, cfg.EXPIRY_COUNT);
+    .slice(0, expiryCountFor(c.key));
 }
 
 /** Expiries currently held in memory for one symbol, nearest first. */
@@ -183,13 +208,35 @@ function memoryExpiries(symbol) {
  * An unknown or delisted name in the env var is skipped with one warning rather
  * than throwing the sampler over.
  */
+/**
+ * Symbols the recorder samples with nobody watching (parity item 8).
+ *
+ * ORDER IS THE PRIORITY ORDER, because ensureSubscriptions() truncates this set
+ * at cfg.TOKEN_BUDGET. Indices first — they are the five instruments the product
+ * is built around and must never lose their slice to a stock. Then explicitly
+ * named stocks, in the order the operator wrote them. Then, only if
+ * RECORD_ALL_STOCKS is on, every remaining F&O name alphabetically, which is a
+ * deterministic order so the same names are recorded across restarts rather than
+ * the set churning with whatever the instrument dump happened to yield.
+ */
 function recordedSymbols() {
   const out = Object.values(UNDERLYINGS).map((c) => c.key);
+  const seen = new Set(out);
+
   for (const name of cfg.RECORDED_STOCKS) {
     const c = resolveSymbol(name);
     if (!c) { vlog(`Ignoring VEGA_RECORDED_STOCKS entry '${name}': no live chain`); continue; }
-    if (!out.includes(c.key)) out.push(c.key);
+    if (!seen.has(c.key)) { seen.add(c.key); out.push(c.key); }
   }
+
+  if (cfg.RECORD_ALL_STOCKS && instrumentService.isReady()) {
+    const all = instrumentService.listTradableUnderlyings()
+      .filter((u) => u.derived)
+      .map((u) => u.key)
+      .sort();
+    for (const key of all) if (!seen.has(key)) { seen.add(key); out.push(key); }
+  }
+
   return out;
 }
 
@@ -328,23 +375,52 @@ const STANDING_KEY = 'vega-sampler';
  * accumulate both. setStandingTokens no-ops when the union is unchanged, so
  * calling this every tick is cheap and an expiry rollover is picked up for free.
  */
+/**
+ * Priority for the token budget. Lower sorts first and is subscribed first.
+ *
+ *   0  an index — the five the product is built around, never displaced.
+ *   1  a target someone is actually looking at right now. A live view failing
+ *      because a headless recorder ate the budget is the worst outcome here.
+ *   2  a recorded stock, accumulating history for nobody in particular.
+ */
+function targetPriority(target) {
+  if (isIndex(target.symbol)) return 0;
+  return target.watched ? 1 : 2;
+}
+
 function ensureSubscriptions() {
   if (!instrumentService.isReady()) return null;
 
   const tokens = [];
   const detail = [];
+  let dropped = 0;
 
   // Index spot tokens are always in the union via SUBSCRIBED_TOKENS, but a
   // stock's spot has to be added explicitly or its chain has no underlying.
-  for (const target of activeTargets()) {
+  const ordered = activeTargets().sort((a, b) => targetPriority(a) - targetPriority(b));
+
+  for (const target of ordered) {
     const c = resolveSymbol(target.symbol);
     if (!c) continue;
 
     const spot = c.spotToken != null ? latestTicksRef?.get(c.spotToken)?.lastPrice ?? null : null;
     const sel = instrumentService.getTokensForExpiry(c.key, target.expiry, {
       spot,
-      strikeWindow: cfg.STRIKE_WINDOW,
+      strikeWindow: strikeWindowFor(c.key),
     });
+
+    /**
+     * TRUNCATE, DO NOT OVERFLOW.
+     *
+     * Kite's ~3,000-token cap is enforced on their side, and exceeding it does
+     * not fail loudly — the ticker simply stops delivering some contracts, which
+     * shows up much later as null Greeks and a rejected day-open on an
+     * apparently random instrument. Stopping at the budget means an
+     * over-ambitious recorded list costs coverage of the LOWEST-priority names,
+     * visibly and deterministically, instead of corrupting everything.
+     */
+    const cost = sel.tokens.length + (c.spotToken != null ? 1 : 0);
+    if (tokens.length + cost > cfg.TOKEN_BUDGET) { dropped += 1; continue; }
 
     tokens.push(...sel.tokens);
     if (c.spotToken != null) tokens.push(c.spotToken);
@@ -355,7 +431,8 @@ function ensureSubscriptions() {
 
   const result = subscriptionManager.setStandingTokens(STANDING_KEY, tokens);
   if (result.changed) {
-    vlog(`Subscribed ${result.count} tokens across ${detail.length} targets`, true);
+    vlog(`Subscribed ${result.count} tokens across ${detail.length} targets`
+      + (dropped ? ` (${dropped} target(s) dropped at the ${cfg.TOKEN_BUDGET}-token budget)` : ''), true);
   }
   return result;
 }
@@ -380,7 +457,9 @@ function buildChainFor(symbol, expiry) {
       symbol: c.key,
       expiry: chosen,
       latestTicks: latestTicksRef,
-      strikeWindow: cfg.STRIKE_WINDOW,
+      // Must match what ensureSubscriptions() actually subscribed, or the chain
+      // is built over strikes that have no ticks and their Greeks come back null.
+      strikeWindow: strikeWindowFor(c.key),
     });
     return { snap, expiry: chosen, price: spotTick.lastPrice, atmStrike: snap.atmStrike ?? null };
   } catch {
@@ -454,16 +533,19 @@ function computeDiffs(symbol, expiry, at = new Date()) {
   const start = startFor(symbol);
   const currentChain = toGreekChain(built.snap.chain);
 
-  // DYNAMIC: the strike set is recomputed from the CURRENT chain each call, then
-  // looked up in the day-open chain (addvega.php). 'frozen' reuses the 09:16
-  // lists instead. Identical for indices and stocks — nothing here branches on
-  // instrument class.
+  // STABLE (default): the day-open basket is held for the session with a
+  // hysteresis exit, so the sums are measured on the same contracts every sample
+  // and the curve stops sawtoothing on ATM churn. 'dynamic' recomputes the band
+  // from the current chain (addvega.php literal); 'frozen' never drops anything.
+  // The METHODOLOGY is identical for indices and stocks — only the delta floor
+  // differs (startFor), which is the one thing parity item 5 asked to differ.
   const point = computePoint({
     currentChain,
     openChain: entry.open.chain,
     start,
     deltaMax: cfg.DELTA_MAX,
     mode: cfg.STRIKE_MODE,
+    hysteresis: cfg.STRIKE_HYSTERESIS,
     frozenStrikes: { callStrikes: entry.open.frozenCallStrikes, putStrikes: entry.open.frozenPutStrikes },
   });
 
@@ -507,7 +589,40 @@ function appendLive(key, entry, point) {
 const tickListeners = new Set();
 function onTick(fn) { tickListeners.add(fn); return () => tickListeners.delete(fn); }
 
+/**
+ * Re-entrancy guard for the sampler.
+ *
+ * THIS IS NOT OPTIONAL AT A 5s CLOCK. sampleAll is async and does real work —
+ * one option-chain build per active target, each solving IV for ~122 contracts,
+ * plus the DB write. At the old 60s cadence a run could never plausibly overlap
+ * itself. At 5s it can, and the failure mode is not a dropped sample: two
+ * concurrent runs compete for the same CPU, so BOTH take longer, so the next
+ * tick is more likely to overlap too. That feedback loop degrades from "fine"
+ * to "process wedged, event loop starved, every HTTP route timing out" over
+ * tens of minutes — observed live at ~240MB RSS after ~90 minutes.
+ *
+ * Skipping the tick is the correct response rather than queueing it: the next
+ * boundary is five seconds away, and a sample of stale ticks is worth less than
+ * the headroom to catch up.
+ */
+let sampleInFlight = false;
+let skippedTicks = 0;
+
 async function sampleAll(now = new Date()) {
+  if (sampleInFlight) {
+    skippedTicks += 1;
+    vlog(`Skipped: previous sample still running (${skippedTicks} total) — the clock is faster than one pass`, false);
+    return;
+  }
+  sampleInFlight = true;
+  try {
+    await runSample(now);
+  } finally {
+    sampleInFlight = false;
+  }
+}
+
+async function runSample(now) {
   // Subscribe BEFORE the window check, not after.
   //
   // The cron fires from 09:00 while the sampling window opens at 09:15, so
@@ -519,7 +634,32 @@ async function sampleAll(now = new Date()) {
 
   if (!isSamplingWindow(now)) { vlog('Skipped: market closed (outside window or weekend)'); return; }
 
-  const epoch = Math.floor(now.getTime() / 1000);
+  /**
+   * SNAP TO THE BASE CLOCK before deciding anything.
+   *
+   * node-cron fires somewhere inside its target second — measured up to 962ms
+   * in, which leaves 38ms before the observed second rolls over — and any
+   * event-loop delay (a chain build running long, GC) adds to that. Taking
+   * `Math.floor(now/1000)` raw therefore lands on second 21 instead of 20 often
+   * enough to matter, and `21 % 5` is not 0, so the sample would be silently
+   * dropped. For a stock persisting at 1m that is a whole minute of data gone.
+   *
+   * FLOOR, not round-to-nearest. node-cron fires AT or AFTER its boundary,
+   * never before, so flooring recovers the intended boundary for any delay
+   * shorter than one interval. Rounding looked equivalent but tolerated only
+   * half an interval: a tick more than 2.5s late snapped FORWARD onto the next
+   * boundary, the following tick snapped onto the same one, and the boundary
+   * between them was never written. Measured on live index data, that residual
+   * was still costing ~2.8% of samples after the first fix.
+   *
+   * It also makes every stored timestamp exactly bucket-aligned, so aggregation
+   * and the live push land on identical x values without relying on the clock
+   * having been punctual.
+   */
+  const base = tfSeconds(cfg.BASE_RESOLUTION) || 5;
+  const epoch = Math.floor(now.getTime() / 1000 / base) * base;
+  const sampledAt = new Date(epoch * 1000);
+
   const written = [];
   const rawSnaps = [];
   const updated = [];
@@ -535,7 +675,7 @@ async function sampleAll(now = new Date()) {
     const key = stateKey(target.symbol, target.expiry);
     if (!state.get(key)?.open) await captureDayOpen(target.symbol, target.expiry);
 
-    const point = computeDiffs(target.symbol, target.expiry, now);
+    const point = computeDiffs(target.symbol, target.expiry, sampledAt);
     if (!point) continue;
 
     const chain = point._chain;
@@ -547,7 +687,14 @@ async function sampleAll(now = new Date()) {
 
     if (persistNow) {
       written.push({ symbol: target.symbol, resolution, ...point });
-      if (chain) rawSnaps.push({ symbol: target.symbol, expiry: point.expiry, sampledAt: new Date(point.time * 1000), chain });
+      // Only retain the full per-strike chain when something will actually
+      // store it. chainSnapshotStore.persist() is a no-op unless
+      // VEGA_STORE_RAW_CHAINS is on, so without this guard every tick built and
+      // held ~15 x 61-strike chains purely to hand them to a function that
+      // discards them — pointless garbage pressure twelve times a minute.
+      if (chain && cfg.STORE_RAW_CHAINS) {
+        rawSnaps.push({ symbol: target.symbol, expiry: point.expiry, sampledAt: new Date(point.time * 1000), chain });
+      }
     }
   }
 
@@ -682,9 +829,56 @@ async function loadToday() {
 // Read API — trend is derived here (single source of truth)
 // ---------------------------------------------------------------------------
 
+/**
+ * THE DISPLAY LAYER (parity item 1) — the single place the sign convention is
+ * applied, and the single place the trend label is derived.
+ *
+ * Every read path in the application funnels through here: getSeries() for the
+ * live buffer, readStoredPoints() for history, loadDelayed() for the public
+ * teaser, vegaStreamService for the WebSocket push, and the Excel export. That
+ * is deliberate — a sign convention applied in four places is a sign convention
+ * that will disagree with itself the first time one of them is edited.
+ *
+ * WHAT IS FLIPPED
+ *   callVegaDiff, putVegaDiff, vegaDiff — the three plotted/tabulated series,
+ *   multiplied by cfg.DISPLAY_SIGN (-1 by default) to match StockMojo and Alpha
+ *   Edge. The flip is self-consistent because diff3 is linear in diff1/diff2:
+ *   -(put - call) === (-put) - (-call), so Difference still reads as
+ *   PutVega - CallVega in displayed terms.
+ *
+ * WHAT IS NOT FLIPPED
+ *   currentCallVega / currentPutVega / openCallVega / openPutVega are absolute
+ *   vega TOTALS, not differences. They are non-negative sums and negating them
+ *   would be meaningless — the day-open panel would read "-1,284.30 of vega".
+ *
+ *   The TREND. classifyTrend's rules (datav1.php) are stated over the STORED
+ *   diffs, where calls gaining vega while puts lose it is a rally and therefore
+ *   Bullish. Feeding it the display-signed pair would relabel every rally as
+ *   Bearish — the exact opposite of parity — so it is always given the raw
+ *   values. Sign parity and trend parity are two different requirements and this
+ *   is the line between them.
+ *
+ * NOTHING WRITTEN TO MYSQL PASSES THROUGH HERE. persistSamples() writes the raw
+ * computePoint() output, so historical rows recorded before this change and rows
+ * recorded after it mean exactly the same thing, and flipping
+ * VEGA_DISPLAY_SIGN back to 1 restores the old presentation with no migration.
+ */
 function decorate(p) {
+  // Raw, stored values — the economic convention the trend rules are written in.
   const t = classifyTrend(p.callVegaDiff, p.putVegaDiff);
-  return { ...p, trend: t.label, trendKey: t.key, trendColor: t.color };
+  const s = cfg.DISPLAY_SIGN;
+
+  const flip = (v) => (v == null || !Number.isFinite(Number(v)) ? v : Number(v) * s);
+
+  return {
+    ...p,
+    callVegaDiff: flip(p.callVegaDiff),
+    putVegaDiff: flip(p.putVegaDiff),
+    vegaDiff: flip(p.vegaDiff),
+    trend: t.label,
+    trendKey: t.key,
+    trendColor: t.color,
+  };
 }
 
 function rowToPoint(r) {
@@ -956,7 +1150,11 @@ async function loadByDate(symbol, date, timeframe = '1m', expiry = null) {
     live,
     expiry: chosen,
     timeframe,
-    resolution: resolution || (live && points.length ? cfg.PERSIST_RESOLUTION.index : null),
+    // Served from the live buffer -> the base clock, whatever this instrument
+    // PERSISTS at. Reporting PERSIST_RESOLUTION.index here (as this once did)
+    // labelled a live stock '5s' purely because indices store at 5s, which is
+    // an answer about the wrong instrument.
+    resolution: resolution || (live && !fromStore && points.length ? cfg.BASE_RESOLUTION : null),
     storedResolutions: available,
     unavailable,
     hasBaseline: !!(meta || summary || (live && chosen && state.get(stateKey(key, chosen))?.open)),
@@ -1002,6 +1200,20 @@ async function loadDelayed(symbol, { delayMinutes = PUBLIC_DELAY_MINUTES, timefr
   const frontExpiry = expiryKey(front?.e);
 
   if (frontExpiry) {
+    /**
+     * PIN TO ONE RESOLUTION.
+     *
+     * A single day can legitimately hold rows at more than one resolution — the
+     * day an index is promoted from 1m to 5s has both, and so does any day
+     * spanning a config change. Reading them together returns two rows for
+     * every minute boundary: bucketByTimeframe would hide most of it (last
+     * value wins per bucket), which is exactly what makes it the kind of bug
+     * that survives review and then shows up as a doubled point count.
+     */
+    const dayResolution = pickResolution(
+      await storedResolutions(key, today, frontExpiry), timeframe
+    );
+
     const [rows] = await db.query(
       `SELECT sampled_at, call_vega_diff, put_vega_diff, vega_diff,
               current_call_vega, current_put_vega, open_call_vega, open_put_vega,
@@ -1009,8 +1221,9 @@ async function loadDelayed(symbol, { delayMinutes = PUBLIC_DELAY_MINUTES, timefr
          FROM vega_timeseries
         WHERE symbol = :symbol AND snapshot_date = :date
           AND expiry = :expiry AND sampled_at <= :cutoff
+          AND (:resolution IS NULL OR resolution = :resolution)
         ORDER BY sampled_at ASC`,
-      { symbol: key, date: today, expiry: frontExpiry, cutoff }
+      { symbol: key, date: today, expiry: frontExpiry, cutoff, resolution: dayResolution || null }
     );
 
     if (rows.length) {
@@ -1041,7 +1254,11 @@ async function loadDelayed(symbol, { delayMinutes = PUBLIC_DELAY_MINUTES, timefr
   );
   const fallbackExpiry = expiryKey(fallbackFront?.e);
 
-  const points = await readStoredPoints(key, fallbackDate, timeframe, fallbackExpiry, null);
+  // Same one-resolution rule as the live path above.
+  const fallbackResolution = pickResolution(
+    await storedResolutions(key, fallbackDate, fallbackExpiry), timeframe
+  );
+  const points = await readStoredPoints(key, fallbackDate, timeframe, fallbackExpiry, fallbackResolution);
   return {
     date: fallbackDate, expiry: fallbackExpiry, points, delayMinutes: minutes,
     isFallbackDay: true,
@@ -1120,6 +1337,37 @@ function getLatest(symbol, expiry = null) {
   return s.length ? s[s.length - 1] : null;
 }
 
+/**
+ * Nightly retention sweep (parity item 8) — keep cfg.RETENTION_DAYS of history.
+ *
+ * Lives here rather than inline in index.js so the three vega tables are always
+ * pruned together and against the SAME cutoff. Splitting them is how you end up
+ * with orphaned baselines: vega_day_open rows for days whose samples are gone,
+ * which then show up in the date picker as sessions with zero points.
+ *
+ * Compared against snapshot_date (the IST trading day) on every table, which is
+ * what the read path and the date picker key off.
+ */
+async function purgeOldHistory(days = cfg.RETENTION_DAYS) {
+  const keep = Math.max(1, Number(days) || cfg.RETENTION_DAYS);
+  const out = {};
+  for (const table of ['vega_timeseries', 'vega_day_open', 'vega_chain_snapshots']) {
+    try {
+      const [res] = await db.query(
+        `DELETE FROM \`${table}\` WHERE snapshot_date < CURDATE() - INTERVAL :keep DAY`,
+        { keep }
+      );
+      out[table] = res.affectedRows || 0;
+    } catch (err) {
+      // A missing optional table (chain snapshots on an install that never
+      // enabled them) must not abort the sweep of the two that matter.
+      out[table] = null;
+      console.warn(`[VegaSeries] Retention sweep skipped ${table}: ${err.message}`);
+    }
+  }
+  return { retentionDays: keep, deleted: out };
+}
+
 function getStats() {
   return {
     sampling: sampleTask !== null,
@@ -1128,10 +1376,25 @@ function getStats() {
     subscription: subscriptionManager.getStats(),
     filterMode: 'abs',
     strikeMode: cfg.STRIKE_MODE,
+    strikeHysteresis: cfg.STRIKE_HYSTERESIS,
+    // -1 means the served series are the negation of the stored PHP-signed
+    // values (StockMojo / Alpha Edge convention). See decorate().
+    displaySign: cfg.DISPLAY_SIGN,
+    stockStart: cfg.STOCK_START,
+    retentionDays: cfg.RETENTION_DAYS,
+    tokenBudget: cfg.TOKEN_BUDGET,
+    recordAllStocks: cfg.RECORD_ALL_STOCKS,
     deltaMax: cfg.DELTA_MAX,
     strikeWindow: cfg.STRIKE_WINDOW,
+    stockStrikeWindow: cfg.STOCK_STRIKE_WINDOW,
     expiryCount: cfg.EXPIRY_COUNT,
     sampleCron: cfg.SAMPLE_CRON,
+    baseResolution: cfg.BASE_RESOLUTION,
+    // Ticks dropped because the previous pass had not finished. Zero is
+    // healthy; a climbing number means one pass no longer fits in one interval
+    // and the active set or STRIKE_WINDOW needs to come down.
+    skippedTicks,
+    sampleInFlight,
     persistResolution: cfg.PERSIST_RESOLUTION,
     recordedStocks: cfg.RECORDED_STOCKS,
     liveBufferPoints: cfg.LIVE_BUFFER_POINTS,
@@ -1189,5 +1452,9 @@ module.exports = {
   resolveSymbol, isIndex, persistResolutionFor, canServe, servableTimeframes,
   storedResolutions, bucketByTimeframe,
   loadDelayed, PUBLIC_DELAY_MINUTES,
-  TIMEFRAMES: cfg.TIMEFRAMES, startFor, todayIst,
+  // Exported so the WebSocket push uses the SAME sign convention and trend
+  // derivation as every other reader — see decorate()'s header.
+  decorate,
+  purgeOldHistory,
+  TIMEFRAMES: cfg.TIMEFRAMES, startFor, strikeWindowFor, expiryCountFor, todayIst,
 };

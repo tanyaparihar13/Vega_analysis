@@ -109,9 +109,13 @@ router.get('/:symbol/series', authenticate, requirePremium, async (req, res) => 
       requestedDate: date,
       live,
       source: live && !fromStore ? 'memory' : 'database',
-      strikeMode: cfg.STRIKE_MODE,                       // 'dynamic' | 'frozen'
-      start: vegaTimeseriesService.startFor(cfgU.key),   // 0.05 or 0.20
+      strikeMode: cfg.STRIKE_MODE,                       // 'stable' | 'frozen' | 'dynamic'
+      start: vegaTimeseriesService.startFor(cfgU.key),   // 0.05 (index) or 0.20 (stock)
       deltaMax: cfg.DELTA_MAX,
+      // -1 => the points below are the negation of the stored PHP-signed values,
+      // i.e. the StockMojo / Alpha Edge convention. Surfaced so a consumer can
+      // tell which convention it received rather than having to assume one.
+      displaySign: cfg.DISPLAY_SIGN,
       hasBaseline,
       // The expiry these points belong to, plus what else was selectable for
       // this day — so the dropdown can stay populated from the same response
@@ -131,6 +135,114 @@ router.get('/:symbol/series', authenticate, requirePremium, async (req, res) => 
   } catch (err) {
     console.error('[vega/series] error:', err.message);
     res.status(500).json({ message: 'Failed to read the vega series' });
+  }
+});
+
+/**
+ * GET /api/vega/:symbol/export?timeframe=&date=&expiry=  ->  .xlsx (parity item 10)
+ *
+ * The data currently on screen, as a spreadsheet.
+ *
+ * IT READS THE EXACT SAME FUNCTION THE CHART DOES. `loadByDate` is what fills
+ * the series endpoint, so the export inherits the timeframe bucketing, the
+ * expiry resolution, the display sign convention and the trend label without
+ * re-deriving any of them. A second query shaped "close enough" is how an export
+ * ends up disagreeing with the table it was taken from — most obviously over the
+ * sign, since the raw MySQL columns are stored in the engine's convention and
+ * only decorate() turns them into what the user is looking at.
+ *
+ * Columns are exactly the ones asked for: Time, Instrument, Expiry, Strike,
+ * Call Vega, Put Vega, Difference, Trend.
+ *
+ * Note this serves the STORED/aggregated series for the requested day. For today
+ * that is the live buffer, i.e. the same array the open chart is drawing.
+ */
+const EXPORT_COLUMNS = [
+  { header: 'Time', key: 'time', width: 12 },
+  { header: 'Instrument', key: 'instrument', width: 14 },
+  { header: 'Expiry', key: 'expiry', width: 13 },
+  { header: 'Strike', key: 'strike', width: 12 },
+  { header: 'Call Vega', key: 'call', width: 14 },
+  { header: 'Put Vega', key: 'put', width: 14 },
+  { header: 'Difference', key: 'diff', width: 14 },
+  { header: 'Trend', key: 'trend', width: 18 },
+];
+
+/** UNIX seconds -> HH:MM:SS in IST. Seconds are always shown: a 5s export whose
+ *  rows all read "09:15" would be indistinguishable garbage. */
+const IST_CLOCK = new Intl.DateTimeFormat('en-GB', {
+  hour: '2-digit', minute: '2-digit', second: '2-digit',
+  hour12: false, timeZone: 'Asia/Kolkata',
+});
+
+router.get('/:symbol/export', authenticate, requirePremium, async (req, res) => {
+  try {
+    const cfgU = getUnderlying(req.params.symbol);
+    if (!cfgU) return res.status(404).json({ message: `Unknown symbol: ${req.params.symbol}` });
+
+    const timeframe = String(req.query.timeframe || '1m');
+    if (!(timeframe in vegaTimeseriesService.TIMEFRAMES)) {
+      return res.status(400).json({
+        message: `Unsupported timeframe: ${timeframe}`,
+        supported: Object.keys(vegaTimeseriesService.TIMEFRAMES),
+      });
+    }
+
+    const dateParam = readDateParam(req.query.date, 'date');
+    if (!dateParam.ok) return res.status(400).json({ message: dateParam.message });
+    if (dateParam.value && dateParam.value > vegaTimeseriesService.todayIst()) {
+      return res.status(400).json({ message: 'date cannot be in the future' });
+    }
+
+    const expiryParam = readDateParam(req.query.expiry, 'expiry');
+    if (!expiryParam.ok) return res.status(400).json({ message: expiryParam.message });
+
+    const date = dateParam.value || vegaTimeseriesService.todayIst();
+    const { expiry } = await vegaTimeseriesService.resolveExpiry(cfgU.key, date, expiryParam.value);
+    const { points } = await vegaTimeseriesService.loadByDate(cfgU.key, date, timeframe, expiry);
+
+    // Required lazily — exceljs is a heavy dependency and nothing else on this
+    // router needs it, so it should not be loaded on a server that never exports.
+    const ExcelJS = require('exceljs');
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'Vega Analysis';
+    workbook.created = new Date();
+
+    const sheet = workbook.addWorksheet(`${cfgU.key} ${timeframe}`.slice(0, 31));
+    sheet.columns = EXPORT_COLUMNS;
+    sheet.getRow(1).font = { bold: true };
+    sheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+    for (const p of points) {
+      sheet.addRow({
+        time: IST_CLOCK.format(new Date(p.time * 1000)),
+        instrument: cfgU.key,
+        expiry: p.expiry || expiry || '',
+        strike: p.atmStrike ?? '',
+        call: p.callVegaDiff,
+        put: p.putVegaDiff,
+        diff: p.vegaDiff,
+        trend: p.trend || '',
+      });
+    }
+
+    for (const key of ['call', 'put', 'diff']) sheet.getColumn(key).numFmt = '0.00';
+
+    // Which selection produced the file, so a downloaded sheet is still
+    // self-describing a week later.
+    const meta = sheet.addRow([]);
+    meta.getCell(1).value = `Instrument ${cfgU.key} · Expiry ${expiry || '—'} · Timeframe ${timeframe} `
+      + `· Date ${date} · ${points.length} rows · IST`;
+    meta.font = { italic: true, size: 9 };
+
+    const filename = `vega_${cfgU.key}_${expiry || 'all'}_${timeframe}_${date}.xlsx`;
+    res.setHeader('Content-Type',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(Buffer.from(await workbook.xlsx.writeBuffer()));
+  } catch (err) {
+    console.error('[vega/export] error:', err.message);
+    res.status(500).json({ message: 'Failed to build the Excel export' });
   }
 });
 

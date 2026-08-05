@@ -243,14 +243,18 @@ function handleSamplerTick(updated) {
 }
 
 /**
- * The sampler's raw buffer points carry no trend (it is derived on read), so
- * decorate here through the same path every other reader uses.
+ * The sampler's raw buffer points are stored in the engine's own (PHP) sign
+ * convention and carry no trend, so they must go through the SAME decorate()
+ * every other reader uses before they go on the wire.
+ *
+ * This used to call classifyTrend directly, which quietly meant the live push
+ * skipped the display-sign flip: a chart left open all session showed the
+ * negation of the same chart reloaded from history. Delegating removes any
+ * possibility of the two conventions drifting apart again — there is now exactly
+ * one function that decides what a served point looks like.
  */
 function decorateForWire(point) {
-  const [decorated] = vegaTimeseriesService.bucketByTimeframe([point], '5s');
-  const { classifyTrend } = require('../utils/vegaTrend');
-  const t = classifyTrend(point.callVegaDiff, point.putVegaDiff);
-  return { ...(decorated || point), trend: t.label, trendKey: t.key, trendColor: t.color };
+  return vegaTimeseriesService.decorate(point);
 }
 
 function getStats() {

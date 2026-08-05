@@ -16,12 +16,22 @@ const DELTA_START = {
   // value for every instrument (0.05); this deliberately diverges from that
   // parity default — NIFTY keeps the tighter 0.05 floor, while the other four
   // underlyings use a 0.20 floor to exclude far-OTM noise from their sums.
+  //
+  // These five are LEFT EXACTLY AS THEY WERE. The parity work asked for a
+  // 0.20-0.60 band on STOCKS specifically (see STOCK_START below); the index
+  // floors are existing, working behaviour and were not in scope.
   NIFTY: 0.05,
   BANKNIFTY: 0.20,
   FINNIFTY: 0.20,
   MIDCPNIFTY: 0.20,
   SENSEX: 0.05,
 };
+
+/** Read a float from the environment, falling back when unset/unparseable. */
+function envNum(name, fallback) {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 /**
  * Trend pill colours. These are sent to the client and rendered as-is, so they
@@ -46,9 +56,95 @@ const TREND = {
 module.exports = {
   DELTA_START,
   DEFAULT_START: 0.05,
-  DELTA_MAX: 0.6,           // PHP: hard-coded 0.6 ceiling in addvega.php
-  STRIKE_MODE: 'dynamic',   // 'dynamic' (addvega.php parity) | 'frozen'
+
+  /**
+   * Delta floor for F&O STOCKS (parity item 5).
+   *
+   * Stocks were previously falling through to DEFAULT_START (0.05), which pulls
+   * a long tail of far-OTM strikes with near-zero, badly-solved vega into both
+   * sums — on a thin stock board that tail is most of the noise in the curve.
+   * StockMojo / Alpha Edge run stocks on a 0.20-0.60 band, so that is what
+   * startFor() now returns for anything that is not one of the curated indices.
+   *
+   * It is applied to the Call sum, the Put sum and therefore the Difference,
+   * because all three come out of the same computePoint() call — there is no
+   * path where one side uses a different band from the other.
+   */
+  STOCK_START: envNum('VEGA_STOCK_DELTA_START', 0.20),
+
+  DELTA_MAX: envNum('VEGA_DELTA_MAX', 0.6),  // PHP: hard-coded 0.6 ceiling in addvega.php
+
+  /**
+   * DISPLAY SIGN — the whole of the sign-parity fix (parity item 1).
+   *
+   * The stored arithmetic is unchanged and stays PHP-faithful:
+   *   call_vega_diff = currentCallVega - openCallVega        (addvega.php diff1)
+   *   put_vega_diff  = currentPutVega  - openPutVega         (diff2)
+   *   vega_diff      = put_vega_diff   - call_vega_diff      (diff3)
+   *
+   * StockMojo / Alpha Edge plot the NEGATION of those three. Rather than
+   * rewriting the engine (which would invalidate every row already recorded and
+   * make old and new history disagree), the flip is applied ONCE, in
+   * vegaTimeseriesService.decorate() — the single function every read path goes
+   * through: the REST series, the WebSocket push, the public delayed teaser, the
+   * market snapshot route and the Excel export. The database is never touched.
+   *
+   * Because diff3 is linear in diff1/diff2, negating all three is
+   * self-consistent: -(put - call) = (-put) - (-call). The Difference series
+   * still equals PutVega - CallVega in displayed terms.
+   *
+   * TREND IS DELIBERATELY *NOT* RECOMPUTED FROM THE FLIPPED NUMBERS. The
+   * datav1.php rules are stated over the stored (economic) diffs, where "calls
+   * gaining vega while puts lose it" is a rally and therefore Bullish. Feeding
+   * them the display-signed values would relabel every rally as Bearish, which
+   * is the opposite of parity. See utils/vegaTrend.js.
+   *
+   * Set VEGA_DISPLAY_SIGN=1 to serve the raw PHP-signed values again.
+   */
+  DISPLAY_SIGN: envNum('VEGA_DISPLAY_SIGN', -1) >= 0 ? 1 : -1,
+
+  /**
+   * Strike-selection methodology (parity item 6).
+   *
+   *   'stable'  DEFAULT. The basket is the set eligible AT DAY-OPEN, held for
+   *             the session, with a hysteresis exit so a contract that has
+   *             genuinely walked out of the band stops contributing. This is
+   *             what removes the per-tick sawtooth: the sums are measured on the
+   *             same contracts minute after minute, so a move in the underlying
+   *             changes the VALUES rather than changing which values are added.
+   *   'frozen'  day-open basket, no exit rule at all (maximum stability).
+   *   'dynamic' addvega.php literal — recompute the band from the current chain
+   *             every sample. This was the previous default; set
+   *             VEGA_STRIKE_MODE=dynamic to restore it exactly.
+   */
+  STRIKE_MODE: ['stable', 'frozen', 'dynamic'].includes(process.env.VEGA_STRIKE_MODE)
+    ? process.env.VEGA_STRIKE_MODE
+    : 'stable',
+
+  /**
+   * Hysteresis margin for 'stable' mode, in delta.
+   *
+   * A strike already in the basket is retained while |delta| stays inside
+   * [start - h, deltaMax + h]. Without the margin a contract sitting exactly on
+   * 0.60 would flicker in and out on every tick, which is the ATM-switching
+   * oscillation this mode exists to remove; with it, a strike has to move a
+   * clear 0.15 of delta beyond the band before it is dropped, and once dropped
+   * it does not come back for the session.
+   */
+  STRIKE_HYSTERESIS: envNum('VEGA_STRIKE_HYSTERESIS', 0.15),
+
   STRIKE_WINDOW: 30,        // how many strikes either side of ATM to build
+
+  /**
+   * Strikes either side of ATM to subscribe for a STOCK.
+   *
+   * A stock board is far shallower than an index board and its liquid strikes
+   * sit much closer to spot, so the index's 30-a-side window mostly buys
+   * untraded contracts — while costing the same 122 tokens against Kite's
+   * ~3,000-per-connection cap. A tighter window is what makes recording many
+   * stocks at once arithmetically possible at all (see RECORD_ALL_STOCKS).
+   */
+  STOCK_STRIKE_WINDOW: Math.max(3, Math.min(Number(process.env.VEGA_STOCK_STRIKE_WINDOW) || 8, 30)),
 
   /**
    * How many expiries per underlying the recorder tracks, nearest first
@@ -64,6 +160,26 @@ module.exports = {
    * first if you need more expiries.
    */
   EXPIRY_COUNT: Math.max(1, Math.min(Number(process.env.VEGA_EXPIRY_COUNT) || 3, 6)),
+
+  /**
+   * Expiries tracked per STOCK. Stock options are monthly, so "the next three
+   * expiries" is three MONTHS out — nobody charts that, and each one costs a
+   * full token slice. One (the front month) is what a stock desk actually reads,
+   * and it triples how many stocks fit inside the token budget.
+   */
+  STOCK_EXPIRY_COUNT: Math.max(1, Math.min(Number(process.env.VEGA_STOCK_EXPIRY_COUNT) || 1, 4)),
+
+  /**
+   * Hard ceiling on the standing subscription, in Kite instrument tokens.
+   *
+   * Kite allows ~3,000 tokens per WebSocket connection and silently misbehaves
+   * past it. The recorder's set is built newest-priority-first (indices, then
+   * on-demand targets, then recorded stocks) and TRUNCATED here, so an
+   * over-ambitious VEGA_RECORDED_STOCKS degrades to "records fewer stocks"
+   * instead of "the whole feed stops working".
+   */
+  TOKEN_BUDGET: Math.max(200, Math.min(Number(process.env.VEGA_TOKEN_BUDGET) || 2800, 3000)),
+
   MARKET_OPEN_MIN: 555,     // 09:15 IST, in minutes-from-midnight
   MARKET_CLOSE_MIN: 930,    // 15:30 IST
 
@@ -76,6 +192,20 @@ module.exports = {
    * of the faster clock is paid only where a faster series is actually wanted.
    */
   SAMPLE_CRON: '*/5 * 9-15 * * 1-5',
+
+  /**
+   * The base clock, as a TIMEFRAMES key. Must match SAMPLE_CRON's step.
+   *
+   * Every sample's timestamp is SNAPPED to a multiple of this before it is used
+   * for the persist decision or written to the database. That is not cosmetic:
+   * node-cron fires anywhere inside its target second (measured up to 962ms in,
+   * i.e. 38ms from rolling over), and any event-loop delay on top of that pushes
+   * the observed second past the boundary. Testing `epoch % 5 === 0` against an
+   * unsnapped clock therefore drops samples at random under load — and for a
+   * stock persisting at 1m, one dropped tick is a whole minute lost.
+   */
+  BASE_RESOLUTION: '5s',
+
   TIMEZONE: 'Asia/Kolkata',
   STORE_RAW_CHAINS: false,  // set true via env to also archive raw per-minute chains
 
@@ -106,25 +236,67 @@ module.exports = {
    * 1m. Both are still SAMPLED at 5s while someone is watching them live; the
    * difference is only what survives the session.
    */
+  /**
+   * Stocks now persist at 5s as well (parity items 7 and 9).
+   *
+   * The seconds tiers are only servable from history when 5s rows exist — a 1m
+   * row cannot be split into four 15s bars — so a stock recorded at 1m had its
+   * whole Seconds group greyed out the moment the user stepped off "today".
+   * With 30-day retention (RETENTION_DAYS) the extra volume is bounded: ~4,500
+   * rows per stock-expiry per session, i.e. roughly 100k rows/month for one
+   * stock, which MySQL does not notice at this table's width.
+   *
+   * Set VEGA_STOCK_RESOLUTION=1m to go back to the coarser, cheaper storage.
+   */
   PERSIST_RESOLUTION: {
     index: process.env.VEGA_INDEX_RESOLUTION || '5s',
-    stock: process.env.VEGA_STOCK_RESOLUTION || '1m',
+    stock: process.env.VEGA_STOCK_RESOLUTION || '5s',
   },
+
+  /**
+   * How many days of vega history to keep (parity item 8).
+   *
+   * The nightly cron in index.js deletes anything older across vega_timeseries,
+   * vega_day_open and vega_chain_snapshots. One month is the stated retention;
+   * it is also what makes 5s storage for stocks affordable.
+   */
+  RETENTION_DAYS: Math.max(1, Math.min(Number(process.env.VEGA_RETENTION_DAYS) || 30, 365)),
 
   /**
    * Stocks the headless recorder samples continuously, so they accumulate
    * history without anyone watching. Comma-separated tradingsymbols, e.g.
    * VEGA_RECORDED_STOCKS=RELIANCE,HDFCBANK,APLAPOLLO
    *
+   * The literal value ALL enrols every F&O stock the instrument master turned
+   * up, in alphabetical order, up to TOKEN_BUDGET — see RECORD_ALL_STOCKS.
+   *
    * Any other F&O stock still works fully in live mode the moment a user selects
-   * it — it simply has no history from before its first viewing. Keep this list
-   * short: each name costs (2*STRIKE_WINDOW+1)*2*EXPIRY_COUNT standing tokens
-   * against Kite's ~3,000 cap, the same budget the indices draw on.
+   * it, AND is persisted while being watched, so it accumulates history from its
+   * first viewing onwards. Each recorded name costs
+   * (2*STOCK_STRIKE_WINDOW+1)*2*STOCK_EXPIRY_COUNT standing tokens against
+   * Kite's ~3,000 cap, the same budget the indices draw on.
    */
   RECORDED_STOCKS: String(process.env.VEGA_RECORDED_STOCKS || '')
     .split(',')
     .map((s) => s.trim().toUpperCase())
-    .filter(Boolean),
+    .filter((s) => s && s !== 'ALL'),
+
+  /**
+   * Enrol EVERY discovered F&O stock in the headless recorder.
+   *
+   * READ THE BUDGET NOTE BEFORE TURNING THIS ON. Kite's ~3,000-token cap is a
+   * hard exchange-side limit, not a tunable: at the default 8-a-side window and
+   * one expiry a stock costs 34 tokens, so ~2,800 tokens minus the indices'
+   * standing ~1,830 leaves room for roughly 28 stocks — not the ~200 in the F&O
+   * list. With VEGA_EXPIRY_COUNT=1 for the indices too, the budget stretches to
+   * roughly 70. Beyond that the set is truncated (alphabetically, deterministic)
+   * and the names dropped are logged once.
+   *
+   * Stocks outside the standing set are NOT invisible: they stream live and are
+   * persisted whenever a user has them open, so coverage grows with use.
+   */
+  RECORD_ALL_STOCKS: /^(1|true|yes|all)$/i.test(String(process.env.VEGA_RECORD_ALL_STOCKS || ''))
+    || /(^|,)\s*ALL\s*(,|$)/i.test(String(process.env.VEGA_RECORDED_STOCKS || '')),
 
   /**
    * Ring-buffer depth for the in-memory live series, per {symbol, expiry}.

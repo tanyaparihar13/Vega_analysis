@@ -227,18 +227,25 @@ cron.schedule('0 3 * * *', async () => {
 }, IST);
 
 /**
- * Retain 90 days of vega history, then drop older rows. The date picker reads
- * from these tables, so this defines how far back a user can look. At ~2,000
- * rows a day this is tiny, but unbounded growth is still worth capping.
- * Bump the interval if you want a longer lookback.
+ * Vega retention — ONE MONTH (vegaConfig.RETENTION_DAYS, default 30).
+ *
+ * Was 90 days and covered only two of the three tables. It now delegates to
+ * vegaTimeseriesService.purgeOldHistory(), which sweeps vega_timeseries,
+ * vega_day_open AND vega_chain_snapshots against the same cutoff — pruning the
+ * series without its baselines used to leave vega_day_open rows for days that
+ * have no samples, which the date picker then offered as empty sessions.
+ *
+ * Shortening the window is also what makes 5s storage for stocks affordable:
+ * a month of seconds-resolution rows is a smaller table than three months of
+ * minute rows across a growing stock list.
  */
 cron.schedule('30 3 * * *', async () => {
   try {
-    const db = require('./config/db');
-    const [ts] = await db.query('DELETE FROM vega_timeseries WHERE snapshot_date < CURDATE() - INTERVAL 90 DAY');
-    const [op] = await db.query('DELETE FROM vega_day_open WHERE snapshot_date < CURDATE() - INTERVAL 90 DAY');
-    if (ts.affectedRows || op.affectedRows) {
-      console.log(`[Cron] Vega retention: pruned ${ts.affectedRows} series + ${op.affectedRows} baseline rows`);
+    const { deleted, retentionDays } = await vegaTimeseriesService.purgeOldHistory();
+    const total = Object.values(deleted).reduce((a, n) => a + (n || 0), 0);
+    if (total) {
+      console.log(`[Cron] Vega retention (${retentionDays}d): pruned `
+        + Object.entries(deleted).map(([t, n]) => `${t}=${n ?? 'skipped'}`).join(' '));
     }
   } catch (err) {
     console.warn('[Cron] Vega retention cleanup failed:', err.message);
