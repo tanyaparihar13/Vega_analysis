@@ -62,9 +62,16 @@ const fmtIst = (unixSeconds) => IST_TIME.format(new Date(unixSeconds * 1000));
 function heightFor(width, variant) {
   if (variant === 'hero') {
     if (width < 480) return 340;
-    if (width < 768) return 420;
+    if (width < 768) return 430;
     if (width < 1100) return 540;
-    return 640;
+    // The hero chart no longer shares its row with the unlock card (that moved
+    // to the focus band above it), so from here up it measures the FULL panel
+    // width — ~1570px inside the 1600px panel. Two more tiers, because a 640px
+    // chart that is 1570px wide is a 2.45:1 letterbox: the curve flattens into
+    // a line and the whole point of showing it is lost. Growing the height with
+    // the width keeps the aspect near 2:1, where the shape stays readable.
+    if (width < 1500) return 620;
+    return 720;
   }
   if (width < 480) return 260;
   if (width < 768) return 300;
@@ -89,7 +96,15 @@ const prefersReducedMotion = () =>
   typeof window !== 'undefined'
   && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
-function PublicVegaChart({ points, loading = false, emptyLabel, variant = 'panel' }) {
+/**
+ * @param {number} [heightOverride] Explicit pixel height, bypassing `heightFor`.
+ *   Used by the hero, where the chart and the records table beside it must be
+ *   EXACTLY the same height — that shared number is owned by the parent, since
+ *   only the parent knows what else is competing for the fold. Without this the
+ *   two would each derive a height and disagree by a few pixels at every
+ *   breakpoint, which reads as a misaligned terminal.
+ */
+function PublicVegaChart({ points, loading = false, emptyLabel, variant = 'panel', heightOverride }) {
   const wrapRef = useRef(null);
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -108,7 +123,15 @@ function PublicVegaChart({ points, loading = false, emptyLabel, variant = 'panel
   // (it reserves the wrapper's space). The chart's width is applied
   // imperatively via `appliedRef` below, so keeping it in state as well would
   // re-render the component on every pixel of a drag-resize for nothing.
-  const [height, setHeight] = useState(() => heightFor(1280, variant));
+  const [height, setHeight] = useState(() => heightOverride || heightFor(1280, variant));
+
+  // The override wins whenever it is supplied, and it must also win over the
+  // ResizeObserver below — so it is applied here rather than only at mount.
+  const overrideRef = useRef(heightOverride);
+  overrideRef.current = heightOverride;
+  useEffect(() => {
+    if (heightOverride) setHeight((prev) => (prev === heightOverride ? prev : heightOverride));
+  }, [heightOverride]);
 
   // The measured width, kept in a ref for the same reason: the ONLY thing that
   // reads it is the tooltip's clamp, which is evaluated during a render that
@@ -156,7 +179,7 @@ function PublicVegaChart({ points, loading = false, emptyLabel, variant = 'panel
     widthRef.current = width;
 
     setHeight((prev) => {
-      const next = heightFor(width, variantRef.current);
+      const next = overrideRef.current || heightFor(width, variantRef.current);
       return prev === next ? prev : next;
     });
   }, []);

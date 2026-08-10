@@ -11,6 +11,8 @@
  * standalone, since it wasn't part of the files you sent over.
  */
 
+const nifty50 = require('../constants/nifty50');
+
 const DELTA_START = {
   // Per-underlying delta floor. PHP's addvega.php only ever had one `start`
   // value for every instrument (0.05); this deliberately diverges from that
@@ -31,6 +33,21 @@ const DELTA_START = {
 function envNum(name, fallback) {
   const n = Number(process.env[name]);
   return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * Comma-separated uppercase symbol list from the environment.
+ * 'ALL' is dropped here — it is a mode flag read by RECORD_ALL_STOCKS, not a
+ * symbol — so an env value of exactly "ALL" yields an empty list and the caller
+ * falls back to its default.
+ */
+function envSymbolList(name) {
+  return [...new Set(
+    String(process.env[name] || '')
+      .split(',')
+      .map((s) => s.trim().toUpperCase())
+      .filter((s) => s && s !== 'ALL')
+  )];
 }
 
 /**
@@ -276,10 +293,26 @@ module.exports = {
    * (2*STOCK_STRIKE_WINDOW+1)*2*STOCK_EXPIRY_COUNT standing tokens against
    * Kite's ~3,000 cap, the same budget the indices draw on.
    */
-  RECORDED_STOCKS: String(process.env.VEGA_RECORDED_STOCKS || '')
-    .split(',')
-    .map((s) => s.trim().toUpperCase())
-    .filter((s) => s && s !== 'ALL'),
+  /**
+   * DEFAULTS TO THE WHOLE SUPPORTED UNIVERSE (constants/nifty50.js).
+   *
+   * The universe was chosen precisely so that every name in it fits inside the
+   * token budget alongside the indices, so there is no reason to record a subset
+   * of it — a supported stock that is not recorded has no history, which the
+   * selector then has to disclose as "live only", for no benefit.
+   *
+   * VEGA_RECORDED_STOCKS still overrides this to record fewer (or different)
+   * names. It cannot record a name outside the universe: recordedSymbols()
+   * resolves every entry through instrumentService, which does not know
+   * off-universe stocks at all.
+   */
+  RECORDED_STOCKS: envSymbolList('VEGA_RECORDED_STOCKS').length
+    ? envSymbolList('VEGA_RECORDED_STOCKS')
+    : nifty50.UNIVERSE_SYMBOLS.slice(),
+
+  /** The supported equity universe, re-exported so callers need one import. */
+  STOCK_UNIVERSE: nifty50.UNIVERSE_SYMBOLS.slice(),
+  STOCK_UNIVERSE_MODE: nifty50.UNIVERSE_MODE,
 
   /**
    * Enrol EVERY discovered F&O stock in the headless recorder.

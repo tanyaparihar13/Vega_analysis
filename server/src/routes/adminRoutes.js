@@ -3,6 +3,7 @@ const router = express.Router();
 const { authenticate, authorize } = require('../middleware/auth');
 const admin = require('../controllers/adminController');
 const adminData = require('../controllers/adminDataController');
+const onboarding = require('../controllers/onboardingController');
 
 router.use(authenticate, authorize('admin'));
 
@@ -14,6 +15,15 @@ router.delete('/users/:id', admin.deleteUser);
 
 router.get('/login-history', admin.loginHistory); // doubles as "User Activity Log"
 router.get('/live-activity', admin.liveActivity);
+
+// Registration funnel — who registered, what they chose, and where they are in
+// the payment / broker workflow. See controllers/onboardingController.js.
+router.get('/onboarding', onboarding.listOnboarding);
+router.patch('/onboarding/:userId', onboarding.updateOnboarding);
+
+router.get('/notifications', onboarding.listNotifications);
+router.patch('/notifications/:id/read', onboarding.readNotification);
+router.post('/notifications/read-all', onboarding.readAllNotifications);
 
 router.get('/plans', admin.listPlans);
 router.post('/plans', admin.createPlan);

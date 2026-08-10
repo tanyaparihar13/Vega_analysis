@@ -34,6 +34,21 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
   const [points, setPoints] = useState([]);
   const [meta, setMeta] = useState(null);
   const [error, setError] = useState(null);
+  /**
+   * True from the moment the selection changes until the server's back-fill for
+   * the NEW selection lands.
+   *
+   * This exists so the chart never goes blank. The previous version cleared
+   * `points` to [] the instant the user picked another instrument, which
+   * guaranteed at least one empty frame — and on a slow round trip, a visibly
+   * empty chart — before the new curve arrived. Switching between 26 stocks
+   * made that the dominant impression of the page.
+   *
+   * Now the outgoing series stays on screen and the consumer renders a loading
+   * veil over it (VegaChart's `loading` prop), so a switch reads as a
+   * transition rather than as a failure. `switching` is what tells it to.
+   */
+  const [switching, setSwitching] = useState(false);
 
   // What we are currently subscribed to, readable from inside the message
   // handler without making the handler depend on it.
@@ -48,12 +63,20 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
 
       if (msg.type === 'vega_error') {
         setError(msg.message || 'Live Vega is unavailable');
+        // A failed switch must not leave the PREVIOUS instrument's curve on
+        // screen under the new instrument's name — that would be worse than an
+        // empty chart, because it looks like real data. Drop it and let the
+        // page fall back to the REST path.
+        setSwitching(false);
+        setPoints([]);
+        setMeta(null);
         return;
       }
 
       if (msg.type === 'vega_subscribed') {
         if (msg.symbol !== want.symbol || msg.timeframe !== want.timeframe) return;
         setError(null);
+        setSwitching(false);
         setMeta({
           symbol: msg.symbol,
           label: msg.label,
@@ -99,15 +122,32 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
     if (!enabled || !symbol || !timeframe) {
       setPoints([]);
       setMeta(null);
+      setSwitching(false);
       return undefined;
     }
 
     marketSocket.connect();
     setError(null);
-    // Clear immediately so the previous instrument's curve is never briefly
-    // shown under the new instrument's name.
-    setPoints([]);
-    setMeta(null);
+
+    /**
+     * DELIBERATELY DOES NOT CLEAR `points` OR `meta`.
+     *
+     * The outgoing series stays mounted until `vega_subscribed` arrives with the
+     * new back-fill, at which point both are replaced in one commit. That is
+     * what removes the blank frame on every instrument switch.
+     *
+     * Two things stop the stale curve from being mistaken for the new one:
+     *   · `switching` drives a loading veil over the plot, so the user can see
+     *     that what is underneath is not yet the thing they asked for
+     *   · the message handler drops any `vega_point` whose symbol/expiry/
+     *     timeframe does not match `wantRef`, so a tick still in flight for the
+     *     previous instrument can never be appended to the new series
+     *
+     * The one case that DOES clear immediately is `vega_error` (see above) —
+     * there, no replacement is coming, so leaving the old curve up would be a
+     * lie rather than a transition.
+     */
+    setSwitching(true);
 
     marketSocket.send({ type: 'subscribe_vega', symbol, expiry: expiry || undefined, timeframe });
 
@@ -116,5 +156,5 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
     };
   }, [symbol, expiry, timeframe, enabled]);
 
-  return { points, meta, error };
+  return { points, meta, error, switching };
 }

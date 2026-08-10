@@ -23,7 +23,16 @@ require('dotenv').config();
 // with a foreign key.
 
 
-const MIGRATIONS = ['schema.sql', 'schema.options.sql', 'schema.instruments.sql', 'schema.vega.sql', 'schema.admin.sql'];
+// schema.onboarding.sql is last: it declares foreign keys onto `users` and
+// backfills from it, so `users` must already exist and be populated.
+const MIGRATIONS = [
+  'schema.sql',
+  'schema.options.sql',
+  'schema.instruments.sql',
+  'schema.vega.sql',
+  'schema.admin.sql',
+  'schema.onboarding.sql',
+];
 /**
  * Migrations need a connection that is NOT bound to a database, because
  * schema.sql starts with CREATE DATABASE. The app pool in config/db.js

@@ -84,7 +84,17 @@ export default function Home() {
         the hero: it is now the first block under the navbar, so it carries the
         top spacing the hero used to.
       */}
-      <section className="relative px-3 pb-10 pt-8 sm:px-6 sm:pb-12 sm:pt-12 lg:px-8">
+      {/*
+        MINIMAL GUTTER — this is a fold budget, not a taste call.
+
+        This section is the first block under the navbar, and the whole terminal
+        (metrics + unlock card + chart + records table) has to fit one screen at
+        1366x768. Padding here comes straight off the chart's height, so it is
+        trimmed to the smallest value that still reads as a margin: pt-8 -> pt-3
+        and pt-12 -> pt-4. DelayedVegaPanel's own `useTerminalHeight` accounts
+        for what is left (see CHROME_PX there).
+      */}
+      <section className="relative px-2 pb-8 pt-3 sm:px-4 sm:pb-10 sm:pt-4 lg:px-6">
         <motion.div
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}

@@ -15,10 +15,68 @@ function authenticate(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = decoded; // { id, email, role }
+
+    /**
+     * SCOPED TOKENS ARE NOT SESSIONS.
+     *
+     * The onboarding step issues a JWT signed with the SAME secret (see
+     * authController.signOnboardingToken) so that a brand-new account — which is
+     * status='pending' and therefore cannot log in — can still identify itself
+     * for exactly one purpose. That token carries `scope: 'onboarding'`.
+     *
+     * Without this check that token would be a valid session everywhere, because
+     * jwt.verify() only proves the signature. It would let anyone who registers
+     * skip the approval gate entirely. Rejecting ANY token that carries a scope
+     * claim — not just 'onboarding' — means a future scoped token is safe by
+     * default rather than safe only if someone remembers to add it here.
+     */
+    if (decoded.scope) {
+      return res.status(401).json({ message: 'This token cannot be used to access the API' });
+    }
+
+    req.user = decoded; // { id, email, role, status }
     next();
   } catch (err) {
     return res.status(401).json({ message: 'Invalid or expired token' });
+  }
+}
+
+/**
+ * Authenticates the short-lived token handed out by POST /api/auth/register.
+ *
+ * The problem this solves: a freshly registered account is 'pending' and cannot
+ * authenticate, so the onboarding page has no session — but it still has to
+ * write a choice against exactly one user. Taking a `userId` from the request
+ * body instead would let anyone set any user's selection and spam admin
+ * notifications on their behalf.
+ *
+ * The token proves "the bearer just completed registration as user N" and
+ * nothing else: it carries no role, expires in 30 minutes, and is rejected by
+ * `authenticate` above.
+ */
+function authenticateOnboarding(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+
+  if (!token) {
+    return res.status(401).json({
+      message: 'Your onboarding session has expired. Please sign in once your account is approved.',
+      code: 'ONBOARDING_TOKEN_MISSING',
+    });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    if (decoded.scope !== 'onboarding' || !decoded.id) {
+      return res.status(401).json({ message: 'Invalid onboarding token', code: 'ONBOARDING_TOKEN_INVALID' });
+    }
+    req.onboarding = { userId: decoded.id };
+    next();
+  } catch (err) {
+    return res.status(401).json({
+      message: 'Your onboarding session has expired. Please contact the administrator on WhatsApp.',
+      code: 'ONBOARDING_TOKEN_EXPIRED',
+    });
   }
 }
 
@@ -92,4 +150,6 @@ function requirePremium(req, res, next) {
   return res.status(403).json({ message, status: req.user.status ?? null });
 }
 
-module.exports = { authenticate, authorize, requirePremium, hasMarketAccess };
+module.exports = {
+  authenticate, authorize, requirePremium, hasMarketAccess, authenticateOnboarding,
+};

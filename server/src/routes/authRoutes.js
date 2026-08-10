@@ -4,8 +4,9 @@ const router = express.Router();
 const {
   register, login, adminLogin, me, publicConfig,
   forgotPassword, validateResetToken, resetPassword,
+  onboardingOptions, selectOnboardingOption, markWhatsappOpened,
 } = require('../controllers/authController');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, authenticateOnboarding } = require('../middleware/auth');
 
 /**
  * Password-reset endpoints get their own limiter, tighter than the 50/15min
@@ -49,6 +50,21 @@ router.post('/register', register);
 router.post('/login', login);
 router.post('/admin-login', adminLogin);
 router.get('/me', authenticate, me);
+
+/**
+ * ---- onboarding (step 2 of registration) ----
+ *
+ * `/options` is public — it is a price list, and the page has to render it
+ * before the user has done anything.
+ *
+ * The two writes take the SCOPED token from /register, not a session: the
+ * account they belong to is status='pending' and cannot log in yet. See
+ * middleware/auth.js `authenticateOnboarding`, and note that `authenticate`
+ * refuses that token everywhere else.
+ */
+router.get('/onboarding/options', onboardingOptions);
+router.post('/onboarding/select', authenticateOnboarding, selectOnboardingOption);
+router.post('/onboarding/whatsapp-opened', authenticateOnboarding, markWhatsappOpened);
 
 // ---- password reset (all public; the emailed token is the credential) ----
 router.post('/forgot-password', requestLimiter, forgotPassword);

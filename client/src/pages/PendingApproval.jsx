@@ -30,31 +30,38 @@ export default function PendingApproval() {
   const name = state?.name;
   const email = state?.email;
   const mobile = state?.mobile;
-  const broker = state?.broker;
   const userId = state?.userId;
-  const accountType = state?.accountType;
+  // From the registration form — the broker they already trade through.
+  const broker = state?.broker;
+  // Set by the onboarding step — how they want to get access. A user who
+  // reached this screen without choosing (expired token, direct visit) simply
+  // has no option to show.
+  const selectedOption = state?.selectedOption;
 
   useEffect(() => {
     if (state?.whatsappUrl) return;
     api.get('/auth/config')
       .then(({ data }) => {
         if (!data.adminWhatsappNumber) return;
+        // Mirrors authController.buildOnboardingWhatsAppUrl field for field —
+        // an admin receiving this fallback must not get a thinner message than
+        // one receiving the real thing, with no way to tell which they have.
         const text =
-          'Hello, I have registered on Vega Analysis and would like my account approved.' +
+          'Hello, I have registered on Vega Analysis.' +
           (name ? `\n\nName: ${name}` : '') +
-          (email ? `\nEmail: ${email}` : '') +
           (mobile ? `\nMobile: ${mobile}` : '') +
+          (email ? `\nEmail: ${email}` : '') +
           (broker ? `\nDemat Broker: ${broker}` : '') +
           (userId ? `\nUser ID: ${userId}` : '') +
-          (accountType ? `\nAccount Type: ${accountType}` : '') +
+          (selectedOption ? `\n\nSelected Option: ${selectedOption}` : '') +
           '\n\nStatus: Pending approval';
         setFallbackUrl(`https://wa.me/${data.adminWhatsappNumber}?text=${encodeURIComponent(text)}`);
       })
       .catch(() => setFallbackUrl(null));
-  }, [state, name, email, mobile, broker, userId, accountType]);
+  }, [state, name, email, mobile, broker, userId, selectedOption]);
 
   const whatsappUrl = state?.whatsappUrl || fallbackUrl;
-  const hasDetails = name || email || mobile || broker || userId || accountType;
+  const hasDetails = name || email || mobile || broker || userId || selectedOption;
 
   return (
     <AuthShell
@@ -87,9 +94,9 @@ export default function PendingApproval() {
           {name && <Row label="Name" value={name} />}
           {email && <Row label="Email" value={email} />}
           {mobile && <Row label="Mobile" value={mobile} />}
-          {broker && <Row label="Broker" value={broker} />}
+          {broker && <Row label="Demat Broker" value={broker} />}
           {userId && <Row label="User ID" value={String(userId)} />}
-          {accountType && <Row label="Account Type" value={accountType} />}
+          {selectedOption && <Row label="Selected Option" value={selectedOption} />}
         </div>
       )}
 

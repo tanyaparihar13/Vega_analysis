@@ -26,6 +26,7 @@
 const cron = require('node-cron');
 const db = require('../config/db');
 const constants = require('../constants/instruments');
+const nifty50 = require('../constants/nifty50');
 
 const { UNDERLYINGS, OPTION_EXCHANGES } = constants;
 
@@ -267,6 +268,30 @@ function buildIndexes(rows) {
     if (expiry < today) continue;
 
     const underlyingKey = row.name.toUpperCase();
+
+    /**
+     * THE UNIVERSE GATE.
+     *
+     * The instrument TABLE keeps every contract — persist() below writes the
+     * whole dump, so the option chain, the watchlist search box and (critically)
+     * the cash-segment spot-token matching all keep working on the full master.
+     * What is gated here is the set of underlyings the product will TRADE ON:
+     * the five curated indices, plus the equity names in constants/nifty50.js.
+     *
+     * Gating at this one point is what makes the restriction total without a
+     * filter in every consumer. Everything downstream resolves a symbol through
+     * resolveUnderlying() — the /vega/instruments catalogue, the WebSocket
+     * subscribe handler, the series routes, the recorder's target list and the
+     * token selection — so an off-universe name simply does not exist to any of
+     * them, rather than existing and being filtered out in five places that can
+     * drift apart.
+     *
+     * Skipping BEFORE bucketFor() also keeps byUnderlying from holding the
+     * per-expiry strike Maps of ~175 unsupported stocks, which is the bulk of
+     * this index's memory.
+     */
+    if (!curatedByName.has(underlyingKey) && !nifty50.isInUniverse(underlyingKey)) continue;
+
     const bucket = bucketFor(underlyingKey);
 
     if (isFuture) {
@@ -320,6 +345,69 @@ function buildIndexes(rows) {
   }
 
   searchIndex = index;
+
+  reportUniverse();
+}
+
+/**
+ * Say out loud which of the configured universe actually resolved to a live,
+ * subscribable chain — and which did not.
+ *
+ * A name in constants/nifty50.js can fail to resolve for three reasons, and all
+ * of them are silent without this: it was renamed or delisted, it dropped out of
+ * the F&O ban/eligibility list, or its cash listing did not match so it has no
+ * spotToken (listTradableUnderlyings() filters on spotToken, so it would vanish
+ * from the dropdown while getExpiries() kept working — the exact failure the
+ * cashByExchangeSymbol index was built to fix).
+ *
+ * Also prints the standing token cost, because the universe size is a direct
+ * consequence of the budget and an operator changing VEGA_STOCK_UNIVERSE needs
+ * to see the arithmetic move.
+ */
+function reportUniverse() {
+  if (nifty50.UNIVERSE_MODE === 'all') {
+    console.warn(
+      `[Instruments] VEGA_STOCK_UNIVERSE=ALL — ${derivedUnderlyings.size} equity underlyings enrolled. `
+      + 'This exceeds the single-connection token budget; expect truncation in ensureSubscriptions().'
+    );
+    return;
+  }
+
+  const resolved = [];
+  const missing = [];
+  const noSpot = [];
+
+  for (const symbol of nifty50.UNIVERSE_SYMBOLS) {
+    const cfg = derivedUnderlyings.get(symbol.toUpperCase());
+    if (!cfg) missing.push(symbol);
+    else if (!cfg.spotToken) noSpot.push(symbol);
+    else resolved.push(symbol);
+  }
+
+  const vcfg = require('../config/vegaConfig');
+  const perStock = nifty50.stockTokenCost(vcfg.STOCK_STRIKE_WINDOW, vcfg.STOCK_EXPIRY_COUNT);
+  const perIndex = ((2 * vcfg.STRIKE_WINDOW + 1) * 2 + 2) * vcfg.EXPIRY_COUNT;
+  const indexCount = Object.values(UNDERLYINGS).filter((u) => getExpiries(u.key).length).length;
+  const projected = indexCount * perIndex + resolved.length * perStock;
+
+  console.log(
+    `[Instruments] Universe: ${resolved.length}/${nifty50.UNIVERSE_SYMBOLS.length} stocks live, `
+    + `${indexCount} indices live`
+  );
+  console.log(
+    `[Instruments] Standing token cost ~${projected} of ${vcfg.TOKEN_BUDGET} budget `
+    + `(${indexCount} x ${perIndex} index + ${resolved.length} x ${perStock} stock)`
+    + (projected > vcfg.TOKEN_BUDGET ? '  ** OVER BUDGET — targets will be dropped **' : '')
+  );
+
+  if (missing.length) {
+    console.warn(`[Instruments] ⚠ No live option chain for: ${missing.join(', ')} `
+      + '(renamed, delisted, or out of F&O — update constants/nifty50.js)');
+  }
+  if (noSpot.length) {
+    console.warn(`[Instruments] ⚠ No spot token resolved for: ${noSpot.join(', ')} `
+      + '(cash listing did not match — these will not appear in the selector)');
+  }
 }
 
 function buildDerivedConfig(key, sampleContract) {

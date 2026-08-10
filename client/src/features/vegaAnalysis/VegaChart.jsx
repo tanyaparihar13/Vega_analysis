@@ -83,11 +83,42 @@ const fmtNum = (v) => (v == null || Number.isNaN(Number(v)) ? '–' : Number(v).
  * actually gets used, capped at 560px so the summary tiles above and the table
  * beside it stay in view together.
  */
+/**
+ * Chart height — a FOLD BUDGET, keyed off the viewport rather than the container.
+ *
+ * Those diverge exactly where it matters: the records table sits beside the
+ * chart from `xl`, so the chart's container is ~1000px of a 1700px page.
+ * Container-width tiers would hand the largest monitor a phone-sized box while
+ * a 320px table sat next to it.
+ *
+ * CHROME_PX is everything stacked above and below the plot inside the fold.
+ * MEASURED on the running dashboard at 1920x970, not estimated: the chart card
+ * starts at y=431 (top bar + page header + merged toolbar + summary tiles),
+ * its own panel head takes 40, and the card padding plus the page's bottom
+ * gutter take another 44. 431 + 40 + 44 = 515.
+ *
+ * Whatever the viewport has left goes to the plot, clamped to the 300-480 band
+ * the brief asks for:
+ *
+ *   1920x1080 -> ~970 usable -> 970-515 = 455  (card bottom lands at ~950)
+ *   1366x768  -> ~658 usable -> 658-515 = 143  -> floored at 300
+ *
+ * The floor sits below the 420 "ideal" on purpose: a 300px chart that is
+ * VISIBLE alongside its table beats a 420px chart that pushes the table off the
+ * screen. The dashboard carries a toolbar the public page does not, so on a
+ * 768px laptop it still needs a short scroll to reach the bottom of the table —
+ * the chart and the table are side by side, so both are read together either
+ * way, which is the requirement that matters.
+ */
+const CHROME_PX = 515;
+
 function heightFor(viewportWidth, viewportHeight) {
   if (viewportWidth < 480) return 300;
   if (viewportWidth < 768) return 340;
-  if (viewportWidth < 1280) return 400;
-  return Math.max(440, Math.min(Math.round((viewportHeight || 800) * 0.5), 560));
+  // Below `xl` the table stacks underneath, so the chart is not competing with
+  // it for the fold and can take a comfortable fixed height.
+  if (viewportWidth < 1280) return 420;
+  return Math.max(300, Math.min((viewportHeight || 800) - CHROME_PX, 480));
 }
 
 /**
@@ -239,9 +270,17 @@ function VegaChart({
       },
       rightPriceScale: {
         borderColor: AXIS_LINE,
-        // Headroom so the top and bottom of the curve never touch the frame.
-        scaleMargins: { top: 0.14, bottom: 0.14 },
+        /**
+         * Headroom so the curve never touches the frame — tightened from 0.14
+         * to 0.09 now that the chart is full width and much taller. At 780px
+         * tall, 14% top and bottom was 218px of dead space; the same visual
+         * breathing room needs a smaller fraction of a bigger box, and the
+         * difference goes straight into plotting area.
+         */
+        scaleMargins: { top: 0.09, bottom: 0.09 },
         entireTextOnly: true,
+        // Wider gutter so 4-figure vega values are never clipped or ellipsised.
+        minimumWidth: 72,
       },
       timeScale: {
         borderColor: AXIS_LINE,
@@ -250,9 +289,12 @@ function VegaChart({
         // library uses this to decide tick DENSITY; the label text itself always
         // comes from tickMarkFormatter.
         secondsVisible: showSecondsRef.current,
-        rightOffset: 4,
+        rightOffset: 8,
         // Stops the axis cramming labels together on a narrow phone.
         minBarSpacing: 0.5,
+        // A full-width chart can afford real separation between ticks; the
+        // library's default of 6 packs a 5s session shoulder to shoulder.
+        barSpacing: 9,
         tickMarkFormatter: (time) => fmtIst(time),
       },
       localization: {
@@ -420,8 +462,8 @@ function VegaChart({
   useEffect(() => {
     chartRef.current?.applyOptions({
       layout: { fontSize: isNarrow ? 11 : 12 },
-      rightPriceScale: { minimumWidth: isNarrow ? 44 : 60 },
-      timeScale: { rightOffset: isNarrow ? 2 : 4 },
+      rightPriceScale: { minimumWidth: isNarrow ? 44 : 72 },
+      timeScale: { rightOffset: isNarrow ? 2 : 8, barSpacing: isNarrow ? 6 : 9 },
     });
     // Series titles are drawn INSIDE the pane; on a narrow chart they overlap
     // the curve, and the legend above already names every series.

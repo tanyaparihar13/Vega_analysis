@@ -92,7 +92,12 @@ function slotFor(client) {
 function handleMessage(client, msg) {
   switch (msg?.type) {
     case 'subscribe_vega':
-      handleSubscribe(client, msg);
+      // Async since the warm-start fallback may read MySQL. The catch is the
+      // outer safety net; handleSubscribe reports its own errors to the client.
+      handleSubscribe(client, msg).catch((err) => {
+        console.warn('[VegaStream] subscribe failed:', err.message);
+        sendToClient(client, { type: 'vega_error', message: 'Could not start the live series' });
+      });
       return true;
     case 'unsubscribe_vega':
       releaseClient(client);
@@ -103,7 +108,7 @@ function handleMessage(client, msg) {
   }
 }
 
-function handleSubscribe(client, { symbol, expiry, timeframe }) {
+async function handleSubscribe(client, { symbol, expiry, timeframe }) {
   try {
     if (!instrumentService.isReady()) {
       throw new Error('Instrument master not loaded yet. An admin must connect Zerodha.');
@@ -159,9 +164,45 @@ function handleSubscribe(client, { symbol, expiry, timeframe }) {
         : null,
     });
 
-    // Back-fill from the live buffer so the chart paints the session so far
-    // rather than growing one point at a time from empty.
-    const points = vegaTimeseriesService.getSeries(cfgU.key, tf, chosen);
+    /**
+     * BACK-FILL, WITH A WARM START.
+     *
+     * The live ring buffer is the fast path and covers the normal case. But it
+     * is EMPTY in two situations that are entirely ordinary, and in both of them
+     * returning `points: []` hands the browser a blank chart for a day that has
+     * rows sitting on disk:
+     *
+     *   · the process restarted mid-session, so loadToday() has run but this
+     *     particular {symbol, expiry} has not been sampled again yet
+     *   · the user selected a stock that nobody has been watching, so the
+     *     sampler has only just been told to start producing it
+     *
+     * loadByDate() already resolves both — it reads the buffer first and falls
+     * back to MySQL — and it applies the same bucketing and decorate() the REST
+     * path uses, so a warm-started chart is byte-identical to a reloaded one.
+     */
+    let points = vegaTimeseriesService.getSeries(cfgU.key, tf, chosen);
+    let source = 'memory';
+
+    if (!points.length) {
+      const stored = await vegaTimeseriesService.loadByDate(
+        cfgU.key, vegaTimeseriesService.todayIst(), tf, chosen
+      );
+      points = stored.points || [];
+      source = points.length ? 'database' : 'empty';
+    }
+
+    /**
+     * The selection may have moved while MySQL was being read — a user clicking
+     * through instruments generates a subscribe per click, and the awaits do not
+     * complete in a guaranteed order. Sending a stale back-fill would repaint
+     * the chart with an instrument the user has already navigated away from.
+     */
+    const current = sessions.get(client);
+    if (!current || current.symbol !== cfgU.key || current.expiry !== chosen || current.timeframe !== tf) {
+      return;
+    }
+    if (client.readyState !== 1 /* OPEN */) return;
 
     sendToClient(client, {
       type: 'vega_subscribed',
@@ -172,6 +213,9 @@ function handleSubscribe(client, { symbol, expiry, timeframe }) {
       timeframe: tf,
       resolution: vegaTimeseriesService.persistResolutionFor(cfgU.key),
       isIndex: vegaTimeseriesService.isIndex(cfgU.key),
+      // 'memory' | 'database' | 'empty' — so the client can tell a warm start
+      // from a genuinely empty session.
+      source,
       count: points.length,
       points,
     });

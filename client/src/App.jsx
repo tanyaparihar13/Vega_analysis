@@ -7,6 +7,7 @@ import PricingPage from './site/pages/Pricing';
 import ContactPage from './site/pages/Contact';
 import Login from './pages/Login';
 import Register from './pages/Register';
+import Onboarding from './pages/Onboarding';
 import ForgotPassword from './pages/ForgotPassword';
 import ResetPassword from './pages/ResetPassword';
 import PendingApproval from './pages/PendingApproval';
@@ -51,6 +52,18 @@ function AppRoutes() {
 
       <Route path="/login" element={<Login />} />
       <Route path="/register" element={<Register />} />
+      {/*
+        ONBOARDING — step 2 of registration, and public by necessity.
+
+        The account it belongs to is status='pending' and cannot log in, so
+        ProtectedRoute would bounce the very user this page exists for. The
+        security boundary is not the route, it is the scope-limited token the
+        register call returned: /api/auth/onboarding/select requires it,
+        it expires in 30 minutes, and middleware/auth.js `authenticate` refuses
+        it on every other endpoint. Reaching this URL without one shows an
+        explanatory message and no way to write anything.
+      */}
+      <Route path="/onboarding" element={<Onboarding />} />
       <Route path="/pending-approval" element={<PendingApproval />} />
       {/*
         PASSWORD RESET — public by design.

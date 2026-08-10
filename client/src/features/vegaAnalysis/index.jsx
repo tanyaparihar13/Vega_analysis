@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   TbChevronLeft, TbChevronRight, TbCalendarStats, TbRefresh,
-  TbDatabase, TbBroadcast, TbClockHour4, TbChevronDown, TbCalendarTime,
+  TbDatabase, TbBroadcast, TbChevronDown, TbCalendarTime,
   TbFileSpreadsheet,
 } from 'react-icons/tb';
 import api from '../../api/axios';
@@ -256,16 +256,18 @@ function SummaryTile({ label, value, tone, sub, signed }) {
       : Number(value) < 0 ? 'text-vega-red'
       : 'text-ink-700';
 
+  // Compact: the cap bar and value keep their identity but give ~30px of height
+  // back to the chart, which is the primary element on this page now.
   return (
     <div className="glass-card overflow-hidden">
-      <div className={`${cap} px-3 py-2 text-2xs font-bold uppercase tracking-wider text-white`}>
+      <div className={`${cap} px-3 py-1.5 text-2xs font-bold uppercase tracking-wider text-white`}>
         {label}
       </div>
-      <div className="px-3 py-3">
-        <div className={`num text-xl font-bold leading-none sm:text-2xl ${valueTone}`}>
+      <div className="px-3 py-2">
+        <div className={`num text-lg font-bold leading-none sm:text-xl ${valueTone}`}>
           {signed ? fmtSigned(value) : fmt(value)}
         </div>
-        {sub && <div className="mt-1.5 text-2xs font-medium text-ink-500">{sub}</div>}
+        {sub && <div className="mt-1 truncate text-2xs font-medium text-ink-500">{sub}</div>}
       </div>
     </div>
   );
@@ -275,28 +277,19 @@ function SummaryTile({ label, value, tone, sub, signed }) {
 function TrendTile({ latest, count }) {
   return (
     <div className="glass-card overflow-hidden">
-      <div className="bg-vega-cyan px-3 py-2 text-2xs font-bold uppercase tracking-wider text-white">
+      <div className="bg-vega-cyan px-3 py-1.5 text-2xs font-bold uppercase tracking-wider text-white">
         Trend
       </div>
-      <div className="px-3 py-3">
-        <div className="flex min-h-[1.75rem] items-center">
+      <div className="px-3 py-2">
+        <div className="flex min-h-[1.5rem] items-center">
           {latest
             ? <TrendBadge label={latest.trend} color={latest.trendColor} />
-            : <span className="text-xl font-bold text-ink-400">–</span>}
+            : <span className="text-lg font-bold text-ink-400">–</span>}
         </div>
-        <div className="mt-1.5 text-2xs font-medium text-ink-500">
+        <div className="mt-1 text-2xs font-medium text-ink-500">
           {count ? `${count} record${count === 1 ? '' : 's'}` : 'No records'}
         </div>
       </div>
-    </div>
-  );
-}
-
-function Row({ label, value }) {
-  return (
-    <div className="flex items-baseline justify-between gap-3 text-xs">
-      <span className="font-medium text-ink-500">{label}</span>
-      <span className="num font-semibold text-ink-900">{value}</span>
     </div>
   );
 }
@@ -760,15 +753,31 @@ export default function VegaAnalysis() {
    */
   const streamHealthy = streamEnabled && !!stream.meta && !stream.error;
 
+  /**
+   * ONE fetch per selection.
+   *
+   * `load` changes identity only when {symbol, timeframe, date, expiry} does, so
+   * this fires exactly once per selection. It used to also depend on
+   * `streamHealthy` — which always flips false -> true once, when the socket's
+   * first `vega_subscribed` lands — so EVERY instrument switch fired two
+   * identical /series requests, the second one arriving after the chart had
+   * already repainted from the stream.
+   */
   useEffect(() => {
-    if (!expiryReady) return undefined; // wait for the expiry list for this scope
+    if (!expiryReady) return; // wait for the expiry list for this scope
     setLoading(true);
     load();
-    if (isToday && !streamHealthy) {
-      const id = setInterval(load, POLL_MS);
-      return () => clearInterval(id);
-    }
-    return undefined;
+  }, [load, expiryReady]);
+
+  /**
+   * Polling is a FALLBACK, not a companion to the stream: it runs only while the
+   * socket is unhealthy (no token, upgrade refused, no Kite session). With the
+   * stream up, a 5s chart costs zero HTTP requests.
+   */
+  useEffect(() => {
+    if (!expiryReady || !isToday || streamHealthy) return undefined;
+    const id = setInterval(load, POLL_MS);
+    return () => clearInterval(id);
   }, [load, isToday, expiryReady, streamHealthy]);
 
   // Days that actually have stored data, for the picker. Re-read on symbol
@@ -868,8 +877,6 @@ export default function VegaAnalysis() {
     }
   }, [servableTimeframes, timeframe]);
 
-  const sessionForDate = sessions.find((s) => s.date === date);
-
   // What the dropdown shows and what the header labels. `data.expiries` is the
   // same list the series response resolved against, so it is used as the
   // fallback when the dedicated call has not answered — the two can never
@@ -920,47 +927,67 @@ export default function VegaAnalysis() {
         </div>
       </div>
 
-      {/* ---------- Instrument + quick index tabs ----------
-          The five indices keep their one-tap chips because they are what most
-          sessions start on; the selector beside them reaches the other ~209
-          F&O names. Both write the same `symbol` state. */}
-      <div className="flex flex-wrap items-center gap-2">
-        <InstrumentSelector
-          indices={availableIndices}
-          stocks={availableStocks}
-          value={symbol}
-          onChange={selectSymbol}
-          loading={catalogue.loading}
-          error={catalogue.error}
-        />
+      {/* ---------- Toolbar ----------
+          The instrument selector, the index chips and every control now share
+          ONE card. They used to be two stacked blocks plus a separate header
+          row, which cost ~120px of vertical space before the chart could even
+          start — on a 1080p laptop that was the difference between the plot
+          being visible on load and needing a scroll. */}
+      <div className="glass-card space-y-3 p-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <InstrumentSelector
+            indices={availableIndices}
+            stocks={availableStocks}
+            value={symbol}
+            onChange={selectSymbol}
+            loading={catalogue.loading}
+            error={catalogue.error}
+          />
 
-        <div className="scroll-thin -mx-3 flex gap-2 overflow-x-auto px-3 pb-1 sm:mx-0 sm:flex-wrap sm:px-0 sm:pb-0">
-          {availableIndices.map((i) => (
-            <button
-              key={i.symbol}
-              onClick={() => selectSymbol(i.symbol)}
-              aria-pressed={symbol === i.symbol}
-              className={`shrink-0 rounded-lg px-3.5 py-2 text-xs font-bold tracking-wide transition-colors sm:text-sm ${
-                symbol === i.symbol
-                  ? 'bg-vega-blue text-white shadow-sm'
-                  : 'border border-vega-border bg-vega-panel text-ink-700 hover:border-vega-border-strong hover:text-ink-900'
-              }`}
+          <div className="scroll-thin -mx-1 flex gap-2 overflow-x-auto px-1 pb-1 sm:mx-0 sm:flex-wrap sm:px-0 sm:pb-0">
+            {availableIndices.map((i) => (
+              <button
+                key={i.symbol}
+                onClick={() => selectSymbol(i.symbol)}
+                aria-pressed={symbol === i.symbol}
+                className={`shrink-0 rounded-lg px-3 py-1.5 text-xs font-bold tracking-wide transition-colors ${
+                  symbol === i.symbol
+                    ? 'bg-vega-blue text-white shadow-sm'
+                    : 'border border-vega-border bg-vega-panel text-ink-700 hover:border-vega-border-strong hover:text-ink-900'
+                }`}
+              >
+                {i.symbol}
+              </button>
+            ))}
+          </div>
+
+          {selectedInstrument?.category === 'stock' && (
+            <span className="pill border-vega-border bg-vega-panel-muted text-ink-600">
+              {selectedInstrument.exchange}
+              {selectedInstrument.lotSize ? ` · lot ${selectedInstrument.lotSize}` : ''}
+            </span>
+          )}
+
+          {/*
+            The delta band, relocated.
+
+            The left rail that used to carry a "Delta filter" card is gone (the
+            dashboard is chart-first now), but the band itself is not cosmetic —
+            it is WHICH contracts the Call and Put sums are built from, and a
+            reader comparing a stock against an index needs to see that they are
+            filtered differently. One pill states it without spending a column.
+          */}
+          {data?.start != null && (
+            <span
+              className="num pill ml-auto border-vega-border bg-vega-panel-muted text-ink-600"
+              title="|delta| band the Call and Put vega sums are summed over, against the day-open baseline"
             >
-              {i.symbol}
-            </button>
-          ))}
+              Δ {data.start.toFixed(2)}–{data.deltaMax?.toFixed(2)}
+            </span>
+          )}
         </div>
 
-        {selectedInstrument?.category === 'stock' && (
-          <span className="pill border-vega-border bg-vega-panel-muted text-ink-600">
-            {selectedInstrument.exchange}
-            {selectedInstrument.lotSize ? ` · lot ${selectedInstrument.lotSize}` : ''}
-          </span>
-        )}
-      </div>
-
-      {/* ---------- Toolbar ---------- */}
-      <div className="glass-card flex flex-wrap items-center justify-between gap-3 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-vega-border pt-3">
         <DateNavigator
           date={date}
           onChange={setDate}
@@ -1003,6 +1030,7 @@ export default function VegaAnalysis() {
             <span className="hidden sm:inline">{exporting ? 'Preparing…' : 'Excel'}</span>
           </button>
         </div>
+        </div>
       </div>
 
       {/* ---------- Headline numbers ---------- */}
@@ -1032,68 +1060,40 @@ export default function VegaAnalysis() {
       )}
 
       {/* ---------- Workspace ----------
-          Stacks on everything up to a large laptop; the table moves beside the
-          chart only when there is genuinely room for both (>=1536px), which is
-          the width at which a 380px table stops squeezing the chart. */}
-      <div className="grid grid-cols-1 gap-4 2xl:grid-cols-[minmax(0,1fr)_380px]">
-        {/*
-          The rail becomes a column only at >=1280. At 1024 the desktop sidebar
-          has just appeared, so a 216px rail on top of it left the chart with
-          466px — narrower than it gets on a tablet. Below xl the rail instead
-          spans the full width and lays its three blocks out side by side.
-        */}
-        <div className="grid min-w-0 grid-cols-1 gap-4 xl:grid-cols-[13.5rem_minmax(0,1fr)]">
-          {/* Settings rail */}
-          <aside className="glass-card grid h-fit grid-cols-1 gap-4 p-4 sm:grid-cols-3 xl:grid-cols-1">
-            <div>
-              <p className="panel-subtitle">Session</p>
-              <p className="num mt-1 text-sm font-bold text-ink-900">{fmtDate(date)}</p>
-              <p className="text-2xs font-medium text-ink-500">{fmtDateLong(date)}</p>
-              {sessionForDate?.firstAt && (
-                <p className="mt-1.5 flex items-center gap-1 text-2xs font-medium text-ink-500">
-                  <TbClockHour4 size={12} />
-                  {fmtTime(sessionForDate.firstAt)}–{fmtTime(sessionForDate.lastAt)} IST
-                </p>
-              )}
-              {data && (
-                <p className="mt-1.5 text-2xs font-medium text-ink-500">
-                  {data.source === 'memory' ? 'Streaming from the live sampler' : 'Read from stored history'}
-                </p>
-              )}
-            </div>
+          TERMINAL LAYOUT: CHART AND RECORDS READ TOGETHER.
 
-            {/* Divider follows the flow direction: a rule above each block when
-                stacked, beside it when the three sit in a row. */}
-            {data && (
-              <div className="border-t border-vega-border pt-3.5 sm:border-l sm:border-t-0 sm:pl-4 sm:pt-0 xl:border-l-0 xl:border-t xl:pl-0 xl:pt-3.5">
-                <p className="panel-subtitle">Delta filter</p>
-                <p className="num mt-1 text-sm font-bold text-ink-900">
-                  {data.start?.toFixed(2)} – {data.deltaMax?.toFixed(2)}
-                </p>
-                <p className="mt-1.5 text-2xs leading-relaxed text-ink-500">
-                  |delta| band matching the addvega filter. Values are differences
-                  against the day-open baseline.
-                </p>
-              </div>
-            )}
+          What was here originally: a 13.5rem settings rail on the left (Session
+          / Delta filter / Day open) and a 380px records table on the right,
+          leaving the chart ~1050px of a 1700px page and starting it ~420px down
+          — below the fold on a 1080p laptop.
 
-            {data?.dayOpen && (
-              <div className="space-y-2 border-t border-vega-border pt-3.5 sm:border-l sm:border-t-0 sm:pl-4 sm:pt-0 xl:border-l-0 xl:border-t xl:pl-0 xl:pt-3.5">
-                <p className="panel-subtitle">Day open</p>
-                <Row label="Call Vega" value={fmt(data.dayOpen.callVega)} />
-                <Row label="Put Vega" value={fmt(data.dayOpen.putVega)} />
-                <Row
-                  label="Strikes"
-                  value={
-                    data.dayOpen.callStrikes == null
-                      ? '–'
-                      : `${data.dayOpen.callStrikes}c / ${data.dayOpen.putStrikes}p`
-                  }
-                />
-              </div>
-            )}
-          </aside>
+          The settings rail is gone entirely. The records table returns to the
+          RIGHT of the chart, because a Vega reading is a comparison between the
+          curve and the numbers behind it, and putting the table below the chart
+          means never seeing both. Same arrangement as the public terminal.
 
+          NOTHING WAS LOST WITH THE RAIL, only relocated:
+            Session date/times -> the Sessions dropdown in the toolbar, which
+                                  already lists each day with its recording window
+            Delta filter       -> the "Δ 0.20–0.60" pill in the toolbar
+            Day open           -> the `sub` line on the Call and Put summary
+                                  tiles, which already read "Open 1284.50"
+
+          The table drops BELOW the chart under 1280px, where a 19rem rail would
+          leave the plot too narrow to read.
+      */}
+      {/*
+        The rail is 24rem, not 20rem.
+
+        At 20rem the records table's natural width was 411px inside a 308px box,
+        so it carried a permanent horizontal scrollbar — the Trend column alone
+        needs 167px because it sizes to the widest label in the session
+        ("Sideways Bullish"), not to the first row. 24rem plus the tighter cell
+        padding in `.data-table` brings the natural width under the available
+        width, so the only scrollbar left is the vertical one that belongs
+        there. The chart gives up 64px and is still the dominant element.
+      */}
+      <div className="grid grid-cols-1 gap-3 xl:grid-cols-[minmax(0,1fr)_24rem]">
           {/* Chart */}
           <section className="glass-card min-w-0 overflow-hidden">
             <div className="panel-head">
@@ -1126,7 +1126,14 @@ export default function VegaAnalysis() {
               <VegaChart
                 points={points}
                 visible={visible}
-                loading={loading && !points.length}
+                /**
+                 * The veil goes up while the socket is switching series, even
+                 * though `points` still holds the OUTGOING curve. That is the
+                 * whole no-blank-chart behaviour: the user sees the previous
+                 * shape dimmed under a spinner instead of an empty box, and it
+                 * is replaced in one commit when the back-fill lands.
+                 */
+                loading={(loading && !points.length) || stream.switching}
                 emptyLabel={error ? null : emptyMessage}
                 onHoverPoint={setHoverTime}
                 instrument={symbol}
@@ -1134,10 +1141,24 @@ export default function VegaAnalysis() {
               />
             </div>
           </section>
-        </div>
 
-        {/* Time-wise historical records */}
-        <section className="glass-card flex min-w-0 flex-col overflow-hidden">
+        {/* Time-wise historical records — beside the chart from `xl`.
+
+            THE WRAPPER EXISTS TO BREAK A SIZING CYCLE.
+
+            As a plain grid item the card sized the row, and the row sized the
+            card: with no cap, the 9,000px table made the row 9,000px tall and
+            dragged the chart card with it. With a cap, the cap and the real row
+            height disagreed and left the bottom of the card blank.
+
+            From `xl` the card is taken OUT OF FLOW (`absolute inset-0`), so it
+            contributes no height at all. The row is then sized by the chart
+            card alone, this wrapper stretches to that row, and the card fills
+            the wrapper — one number, defined in one place, with no arithmetic
+            repeated in CSS. Below `xl` both revert to normal flow and the
+            `max-h-[22rem]` on the scroll box takes over. */}
+        <div className="relative min-w-0">
+        <section className="glass-card flex min-w-0 flex-col overflow-hidden xl:absolute xl:inset-0">
           <div className="panel-head">
             <h2 className="panel-title">Time-wise Records</h2>
             {/* Naming the expiry here is what stops the table being read as
@@ -1153,12 +1174,26 @@ export default function VegaAnalysis() {
           </div>
 
           {/*
-            The scroll box is capped by viewport height on wide screens so the
-            table scrolls internally beside the chart, and by a fixed height
-            when stacked underneath — an uncapped table with 375 minute-rows
-            would otherwise make the page metres long on a phone.
+            HEIGHT COMES FROM THE FLEX PARENT, NOT FROM A SECOND CALCULATION.
+
+            This used to carry `xl:max-h-[calc(100vh-32rem)]` — an independent
+            guess at the chart's height. The card ALREADY stretches to the grid
+            row that the chart card defines, so there were two competing numbers
+            and the smaller one won, leaving the bottom of the card blank. At
+            1366x768 the gap was ~190px: rows crowded into the top ~146px and
+            the rest of the card sat empty.
+
+            `flex-1` + `min-h-0` is the whole fix. `min-h-0` is not optional — a
+            flex item defaults to `min-height:auto`, which refuses to shrink
+            below its content, and the content here is a ~9,000px table. Without
+            it the box grows to the full table height and blows the card open
+            instead of scrolling inside it.
+
+            The cap survives only BELOW `xl`, where the table stacks under the
+            chart and has no grid row to inherit a height from; there an
+            uncapped 4,500-row table would make the page metres long.
           */}
-          <div className="table-scroll max-h-[26rem] flex-1 lg:max-h-[32rem] 2xl:max-h-[calc(100vh-19rem)]">
+          <div className="table-scroll min-h-0 max-h-[22rem] flex-1 xl:max-h-none">
             <table className="data-table">
               <thead>
                 <tr>
@@ -1204,6 +1239,7 @@ export default function VegaAnalysis() {
             </table>
           </div>
         </section>
+        </div>
       </div>
     </div>
   );

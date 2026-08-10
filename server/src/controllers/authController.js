@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const db = require('../config/db');
 const mailService = require('../services/mailService');
+const notificationService = require('../services/notificationService');
 require('dotenv').config();
 
 /**
@@ -88,6 +89,114 @@ function istTimestamp(d = new Date()) {
   }).format(d);
 }
 
+/* ==========================================================================
+   ONBOARDING — step 2 of registration
+   --------------------------------------------------------------------------
+   Registration no longer ends at WhatsApp. It creates the account, then sends
+   the user to /onboarding to declare HOW they intend to get access. That choice
+   is what goes to the admin, because "someone registered" is not actionable
+   while "someone wants to pay ₹4,999" is.
+
+   ONE TABLE OF TRUTH. These three keys are the `selected_option` ENUM in
+   schema.onboarding.sql, the `option` accepted by selectOnboardingOption below,
+   and the buttons rendered by client/src/pages/Onboarding.jsx. A key added in
+   one place and not the others fails at the ENUM, which is the loudest of the
+   available failure modes and therefore the right one.
+
+   `brokerChoice` writes to user_onboarding.broker_choice ONLY. It never touches
+   users.broker — that column holds the demat broker the user declared at
+   registration, which is a different fact and must survive this step. See the
+   note in selectOnboardingOption().
+   ========================================================================== */
+const ONBOARDING_OPTIONS = {
+  lifetime: {
+    key: 'lifetime',
+    label: 'Lifetime Access',
+    message: 'I am ready to pay for Lifetime Access',
+    priceInr: 4999,
+    paymentIntent: 'lifetime',
+    brokerChoice: null,
+  },
+  dhan: {
+    key: 'dhan',
+    label: 'Open an account with Dhan',
+    message: 'I am ready to open an account with Dhan',
+    priceInr: null,
+    paymentIntent: null,
+    brokerChoice: 'dhan',
+  },
+  angel_one: {
+    key: 'angel_one',
+    label: 'Open an account with Angel One',
+    message: 'I am ready to open an account with Angel One',
+    priceInr: null,
+    paymentIntent: null,
+    brokerChoice: 'angel_one',
+  },
+};
+
+const ONBOARDING_TOKEN_TTL = '30m';
+
+/**
+ * A token that proves "the bearer just registered as user N", and nothing else.
+ *
+ * It exists because the account it identifies is status='pending' and therefore
+ * CANNOT log in — so there is no session to authorise step 2 with, and reading a
+ * userId out of the request body would let anyone write a selection against any
+ * account.
+ *
+ * Carries no role and no status, so it cannot be mistaken for a session, and
+ * middleware/auth.js `authenticate` explicitly rejects anything with a `scope`
+ * claim. Short-lived because it only has to survive one page transition.
+ */
+function signOnboardingToken(userId) {
+  return jwt.sign(
+    { id: userId, scope: 'onboarding' },
+    process.env.JWT_SECRET,
+    { expiresIn: process.env.ONBOARDING_TOKEN_TTL || ONBOARDING_TOKEN_TTL }
+  );
+}
+
+/**
+ * The WhatsApp handoff for a completed onboarding selection.
+ *
+ * Same click-to-chat mechanism as before (https://wa.me/...), for the same
+ * reasons: it only OPENS a chat with the text prefilled, the user presses Send
+ * themselves, nothing is transmitted on their behalf, and no Business API
+ * credentials, Meta approval or per-message cost are involved.
+ *
+ * Carries exactly the fields the brief specifies — Name, Mobile, Email,
+ * registration date and time, the selected option, and the User ID.
+ *
+ * STILL NO PASSWORD, EVER. It is bcrypt-hashed at cost 12 the moment it arrives
+ * and never exists in plaintext afterwards. A WhatsApp thread is a plaintext log
+ * on two phones and a cloud backup.
+ */
+function buildOnboardingWhatsAppUrl({ name, email, mobile, broker, userId, option, registeredAt }) {
+  const number = String(process.env.ADMIN_WHATSAPP_NUMBER || '').replace(/\D/g, '');
+  if (!number) return null;
+
+  const opt = ONBOARDING_OPTIONS[option];
+  const selection = opt
+    ? `${opt.message}${opt.priceInr ? ` — ₹${opt.priceInr.toLocaleString('en-IN')}` : ''}`
+    : '—';
+
+  const text =
+    `Hello, I have registered on Vega Analysis.\n\n`
+    + `Name: ${name}\n`
+    + `Mobile: ${mobile || '-'}\n`
+    + `Email: ${email}\n`
+    // The broker they ALREADY hold, from the registration form — distinct from
+    // the Selected Option below, which is what they are willing to do next.
+    + `Demat Broker: ${BROKERS[broker] || '-'}\n`
+    + `User ID: ${userId}\n`
+    + `Registered: ${istTimestamp(registeredAt ? new Date(registeredAt) : new Date())} IST\n\n`
+    + `Selected Option: ${selection}\n\n`
+    + `Status: Pending approval`;
+
+  return `https://wa.me/${number}?text=${encodeURIComponent(text)}`;
+}
+
 /**
  * Builds the prefilled WhatsApp handoff link carrying the new registration to
  * the administrator.
@@ -136,13 +245,33 @@ function accountTypeLabel(role = 'free', status = 'pending') {
 /**
  * POST /api/auth/register  (public — always role 'free', status 'pending')
  *
- * Returns NO JWT. A pending account cannot log in, so handing back a token
- * would let a brand-new signup straight into the dashboard and make the whole
- * approval gate decorative.
+ * STEP 1 OF TWO. Creates the account and a pending onboarding record, then hands
+ * back a scoped token so the client can move to /onboarding and declare which
+ * access route it wants.
+ *
+ * WHAT CHANGED, AND WHY IT MATTERS
+ *   · WhatsApp is NOT opened here any more. It opens once the user has chosen an
+ *     option on /onboarding, so the admin receives an actionable lead ("wants
+ *     Lifetime Access") rather than a bare "someone signed up".
+ *   · `confirmPassword` is checked SERVER-SIDE. The form checks it too, but a
+ *     form check is a convenience; this is the one that decides.
+ *
+ * THE DEMAT BROKER IS COLLECTED HERE, and it is a DIFFERENT FACT from the
+ * onboarding choice. This one answers "which broker do you already trade
+ * through?" (Zerodha / Dhan / Upstox / Groww / Angel One) and lands in
+ * users.broker. The onboarding step answers "how do you want to get access?"
+ * and lands in user_onboarding.broker_choice. A user can legitimately hold a
+ * Zerodha account today AND be willing to open a Dhan account for access, so
+ * the two are stored separately and neither overwrites the other.
+ *
+ * Returns NO SESSION JWT. A pending account cannot log in, so handing back a
+ * real token would make the approval gate decorative. The onboarding token it
+ * does return is scope-limited and rejected by `authenticate`.
  */
 async function register(req, res) {
+  let conn;
   try {
-    const { name, email, password } = req.body;
+    const { name, email, password, confirmPassword } = req.body;
     // The form labels this "Mobile"; the column has always been `phone`.
     const mobile = req.body.mobile ?? req.body.phone ?? null;
     const broker = req.body.broker ? String(req.body.broker).toLowerCase() : null;
@@ -150,12 +279,14 @@ async function register(req, res) {
     if (!name || !email || !password) {
       return res.status(400).json({ message: 'name, email and password are required' });
     }
-    // Server-side password policy. The form checks the same rules for feedback,
-    // but a form check is a convenience, not a control — this is the one that
-    // actually decides.
     const passwordError = validatePassword(password);
     if (passwordError) {
       return res.status(400).json({ message: passwordError });
+    }
+    // Only enforced when the client sent the field, so an existing integration
+    // that posts {name,email,password,mobile} keeps working unchanged.
+    if (confirmPassword != null && confirmPassword !== password) {
+      return res.status(400).json({ message: 'Passwords do not match.' });
     }
     if (!mobile) {
       return res.status(400).json({ message: 'mobile number is required' });
@@ -163,9 +294,12 @@ async function register(req, res) {
     if (!broker) {
       return res.status(400).json({ message: 'demat broker is required' });
     }
-    // Whitelisted before it reaches SQL. Without this an unknown value hits the
-    // ENUM and MySQL either truncates it to '' or errors, depending on strict
-    // mode — both of which surface as an opaque 500 to someone signing up.
+    /**
+     * Whitelisted BEFORE it reaches SQL. Without this an unknown value hits the
+     * `broker` ENUM and MySQL either truncates it to '' or errors depending on
+     * strict mode — both of which surface as an opaque 500 to someone signing
+     * up. The BROKERS map and the ENUM in schema.sql must agree.
+     */
     if (!Object.prototype.hasOwnProperty.call(BROKERS, broker)) {
       return res.status(400).json({
         message: `broker must be one of: ${Object.keys(BROKERS).join(', ')}`,
@@ -178,29 +312,214 @@ async function register(req, res) {
     }
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const [result] = await db.query(
+
+    /**
+     * ONE TRANSACTION.
+     *
+     * A user row without its onboarding row is invisible to the admin's
+     * Onboarding tab — the funnel would have no record of them and nobody would
+     * ever chase the lead. Committing both together means that cannot happen.
+     */
+    conn = await db.getConnection();
+    await conn.beginTransaction();
+
+    const [result] = await conn.query(
       `INSERT INTO users (name, email, password_hash, phone, broker, role, is_active, status)
        VALUES (:name, :email, :passwordHash, :phone, :broker, 'free', 1, 'pending')`,
       { name, email, passwordHash, phone: mobile, broker }
     );
 
-    const accountType = accountTypeLabel('free', 'pending');
+    await conn.query(
+      `INSERT INTO user_onboarding (user_id, registration_source)
+       VALUES (:userId, 'web')
+       ON DUPLICATE KEY UPDATE user_id = user_id`,
+      { userId: result.insertId }
+    );
+
+    await conn.commit();
 
     res.status(201).json({
       status: 'pending',
-      message: 'Registration received. An administrator must approve your account before you can sign in.',
+      message: 'Account created. Choose how you would like to get access.',
       user: {
-        id: result.insertId, name, email, mobile,
-        broker, brokerLabel: BROKERS[broker], status: 'pending',
-        accountType,
+        id: result.insertId,
+        name,
+        email,
+        mobile,
+        broker,
+        brokerLabel: BROKERS[broker],
+        status: 'pending',
+        accountType: accountTypeLabel('free', 'pending'),
       },
-      whatsappUrl: buildWhatsAppUrl({
-        name, email, mobile, broker, userId: result.insertId, accountType,
+      // Step 2's credential. Held in memory / sessionStorage by the client —
+      // never localStorage, where it would outlive the tab it belongs to.
+      onboardingToken: signOnboardingToken(result.insertId),
+      nextStep: '/onboarding',
+    });
+  } catch (err) {
+    if (conn) await conn.rollback().catch(() => {});
+    console.error('[register] error:', err.message);
+    res.status(500).json({ message: 'Registration failed' });
+  } finally {
+    if (conn) conn.release();
+  }
+}
+
+/**
+ * GET /api/auth/onboarding/options   (public)
+ *
+ * The three choices and their prices, served rather than hardcoded in the
+ * bundle, so the price shown on the button and the price written to
+ * user_onboarding.price_inr are the same number from the same place.
+ */
+function onboardingOptions(req, res) {
+  res.json({
+    options: Object.values(ONBOARDING_OPTIONS).map((o) => ({
+      key: o.key,
+      label: o.label,
+      message: o.message,
+      priceInr: o.priceInr,
+    })),
+  });
+}
+
+/**
+ * POST /api/auth/onboarding/select   (onboarding token)
+ * Body: { option: 'lifetime' | 'dhan' | 'angel_one' }
+ *
+ * STEP 2 OF TWO. Records the choice, mirrors the broker onto the user row,
+ * raises an admin notification, and returns the prefilled WhatsApp link.
+ *
+ * IDEMPOTENT BY DESIGN. A double-click, a retry after a flaky connection, or a
+ * user going back and choosing again all land here; the row is updated in place
+ * (one row per user, enforced by uq_onboarding_user) and the notification is
+ * only raised when the selection actually CHANGES. Without that guard, an
+ * impatient double-click would put two identical leads in front of the admin.
+ */
+async function selectOnboardingOption(req, res) {
+  try {
+    const userId = req.onboarding.userId;
+    const key = String(req.body.option || '').toLowerCase();
+    const option = ONBOARDING_OPTIONS[key];
+
+    if (!option) {
+      return res.status(400).json({
+        message: `option must be one of: ${Object.keys(ONBOARDING_OPTIONS).join(', ')}`,
+      });
+    }
+
+    const [rows] = await db.query(
+      `SELECT u.id, u.name, u.email, u.phone, u.broker, u.created_at, o.selected_option
+         FROM users u
+         LEFT JOIN user_onboarding o ON o.user_id = u.id
+        WHERE u.id = :userId`,
+      { userId }
+    );
+    const user = rows[0];
+    if (!user) return res.status(404).json({ message: 'Account not found' });
+
+    const isChange = user.selected_option !== option.key;
+
+    await db.query(
+      `INSERT INTO user_onboarding
+         (user_id, registration_source, selected_option, payment_intent, broker_choice,
+          price_inr, selected_at, payment_status, broker_status)
+       VALUES (:userId, 'web', :selected, :intent, :broker, :price, NOW(), :paymentStatus, :brokerStatus)
+       ON DUPLICATE KEY UPDATE
+         selected_option = VALUES(selected_option),
+         payment_intent  = VALUES(payment_intent),
+         broker_choice   = VALUES(broker_choice),
+         price_inr       = VALUES(price_inr),
+         selected_at     = VALUES(selected_at),
+         payment_status  = VALUES(payment_status),
+         broker_status   = VALUES(broker_status)`,
+      {
+        userId,
+        selected: option.key,
+        intent: option.paymentIntent,
+        broker: option.brokerChoice,
+        price: option.priceInr,
+        // Choosing an option is what puts the lead into the queue the admin
+        // works from; 'none' would leave a chosen lead looking unstarted.
+        paymentStatus: option.paymentIntent ? 'pending' : 'none',
+        brokerStatus: option.brokerChoice ? 'pending' : 'none',
+      }
+    );
+
+    /**
+     * users.broker IS DELIBERATELY NOT TOUCHED HERE.
+     *
+     * An earlier revision mirrored the onboarding choice onto it. That was
+     * wrong once the registration form collects a demat broker again: a user
+     * who registers with Zerodha and then offers to open a Dhan account would
+     * have their real, existing broker silently overwritten with 'dhan', and
+     * the admin would lose the very fact they need to know before calling.
+     *
+     * Two columns, two questions:
+     *   users.broker                    which broker they ALREADY trade through
+     *   user_onboarding.broker_choice   which account they are willing to OPEN
+     */
+
+    if (isChange) {
+      await notificationService.create({
+        type: 'onboarding.selected',
+        title: `${user.name} chose: ${option.label}`,
+        body: `${user.email} · ${user.phone || 'no mobile'}`
+          + `${option.priceInr ? ` · ₹${option.priceInr.toLocaleString('en-IN')}` : ''}`,
+        userId,
+        payload: {
+          option: option.key,
+          label: option.label,
+          priceInr: option.priceInr,
+          name: user.name,
+          email: user.email,
+          mobile: user.phone,
+        },
+      });
+    }
+
+    res.json({
+      ok: true,
+      selectedOption: option.key,
+      label: option.label,
+      priceInr: option.priceInr,
+      message: 'Your choice has been recorded.',
+      whatsappUrl: buildOnboardingWhatsAppUrl({
+        name: user.name,
+        email: user.email,
+        mobile: user.phone,
+        broker: user.broker,
+        userId,
+        option: option.key,
+        registeredAt: user.created_at,
       }),
     });
   } catch (err) {
-    console.error('[register] error:', err.message);
-    res.status(500).json({ message: 'Registration failed' });
+    console.error('[selectOnboardingOption] error:', err.message);
+    res.status(500).json({ message: 'Could not record your choice. Please try again.' });
+  }
+}
+
+/**
+ * POST /api/auth/onboarding/whatsapp-opened   (onboarding token)
+ *
+ * Best-effort funnel telemetry: the client calls this when it opens the wa.me
+ * link. It records that the handoff was ATTEMPTED — it cannot know whether the
+ * user actually pressed Send, which is why the column distinguishes 'opened'
+ * from 'confirmed' and only an admin can set the latter.
+ */
+async function markWhatsappOpened(req, res) {
+  try {
+    await db.query(
+      `UPDATE user_onboarding
+          SET whatsapp_status = 'opened', whatsapp_opened_at = NOW()
+        WHERE user_id = :userId AND whatsapp_status = 'not_sent'`,
+      { userId: req.onboarding.userId }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[markWhatsappOpened] error:', err.message);
+    res.status(500).json({ message: 'Could not update onboarding status' });
   }
 }
 
@@ -560,6 +879,9 @@ function publicConfig(req, res) {
 module.exports = {
   register, login, adminLogin, me, publicConfig, buildWhatsAppUrl, BROKERS,
   forgotPassword, validateResetToken, resetPassword,
+  // Onboarding (step 2 of registration)
+  onboardingOptions, selectOnboardingOption, markWhatsappOpened,
+  ONBOARDING_OPTIONS, buildOnboardingWhatsAppUrl, signOnboardingToken,
   // Exported so the route layer and any future caller share one definition of
   // "an acceptable password" rather than re-deriving it.
   validatePassword, PASSWORD_MIN,

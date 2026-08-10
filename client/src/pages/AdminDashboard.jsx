@@ -4,8 +4,12 @@ import DataManagementPanel from '../features/admin/DataManagementPanel';
 import PurgeBackupPanel from '../features/admin/PurgeBackupPanel';
 import AuditLogPanel from '../features/admin/AuditLogPanel';
 import UserActivityPanel from '../features/admin/UserActivityPanel';
+import OnboardingPanel from '../features/admin/OnboardingPanel';
 
-const TABS = ['Overview', 'Data Management', 'Purge & Backup', 'Audit Log', 'User Activity'];
+// Onboarding sits second, right after Overview: it is the queue with work in
+// it, and burying it behind the data-management tabs would mean new leads are
+// found rather than seen.
+const TABS = ['Overview', 'Onboarding', 'Data Management', 'Purge & Backup', 'Audit Log', 'User Activity'];
 
 function ZerodhaPanel() {
   const [status, setStatus] = useState(null);
@@ -649,6 +653,7 @@ export default function AdminDashboard() {
       </div>
 
       {tab === 'Overview' && <OverviewTab />}
+      {tab === 'Onboarding' && <OnboardingPanel />}
       {tab === 'Data Management' && <DataManagementPanel />}
       {tab === 'Purge & Backup' && <PurgeBackupPanel />}
       {tab === 'Audit Log' && <AuditLogPanel />}

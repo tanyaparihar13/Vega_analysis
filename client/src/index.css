@@ -166,14 +166,19 @@
   /* Sticky header that actually stays put inside a scrolling container.
      `position: sticky` on <thead> is unreliable across browsers, so it goes on
      the cells — which is the combination that works in Safari too. */
+  /* px-2, not px-3. The Vega records table lives in a 24rem rail beside the
+     chart, and 12px of padding on both sides of five columns was 40px of the
+     ~103px that pushed the table into a horizontal scrollbar. 8px still reads
+     as a comfortable gutter at this density. `.data-table` is used by exactly
+     one component (the Vega records table), so this is not a global change. */
   .data-table thead th {
-    @apply sticky top-0 z-20 whitespace-nowrap bg-ink-800 px-3 py-2.5
+    @apply sticky top-0 z-20 whitespace-nowrap bg-ink-800 px-2 py-2.5
            text-2xs font-bold uppercase tracking-wider text-white;
     box-shadow: theme('boxShadow.sticky-head');
   }
 
   .data-table tbody td {
-    @apply whitespace-nowrap border-b border-vega-border/70 px-3 py-2 text-xs text-ink-700;
+    @apply whitespace-nowrap border-b border-vega-border/70 px-2 py-2 text-xs text-ink-700;
   }
   .data-table tbody tr:nth-child(even) {
     @apply bg-vega-panel-muted;
@@ -646,4 +651,27 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
+}
+/* Dark theme dropdown fix */
+.site-input {
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+}
+
+/* Select dropdown */
+select.site-input {
+  background-color: rgba(255, 255, 255, 0.04);
+  color: #eaf2f7;
+}
+
+/* Dropdown options */
+select.site-input option {
+  background-color: #10161d;
+  color: #eaf2f7;
+}
+
+/* Placeholder option */
+select.site-input option[value=""] {
+  color: #8fa7a0;
 }
