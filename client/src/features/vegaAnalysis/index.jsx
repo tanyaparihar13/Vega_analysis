@@ -95,7 +95,8 @@ const FALLBACK_INDICES = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'SENSE
  */
 const TIMEFRAME_GROUPS = [
   { label: 'Seconds', options: ['5s', '10s', '15s', '30s'] },
-  { label: 'Minutes', options: ['1m', '3m', '5m', '10m', '15m'] },
+  { label: 'Minutes', options: ['1m', '3m', '5m', '10m', '15m', '30m'] },
+  { label: 'Hours', options: ['1h'] },
 ];
 const ALL_TIMEFRAMES = TIMEFRAME_GROUPS.flatMap((g) => g.options);
 
@@ -1056,6 +1057,25 @@ export default function VegaAnalysis() {
           className="rounded-xl border border-vega-red/40 bg-vega-red-soft p-4 text-sm font-medium text-vega-red"
         >
           {error}
+        </div>
+      )}
+
+      {/*
+        NOT AN ERROR (B-04).
+
+        The server refuses to stream an expiry it is not recording, rather than
+        silently substituting a different contract — which used to leave the
+        wrong expiry's curve frozen on screen under the selected expiry's label.
+        When that happens the chart falls back to the stored series for the
+        expiry the user actually chose, so this is information, not a failure.
+      */}
+      {!error && stream.notice && (
+        <div
+          role="status"
+          className="rounded-xl border border-vega-border bg-vega-panel-muted p-3 text-sm font-medium text-ink-600"
+        >
+          {stream.notice}
+          <span className="ml-1 text-ink-500">Showing stored data for this expiry instead.</span>
         </div>
       )}
 

@@ -123,19 +123,71 @@ function standingTotal() {
   return union.size;
 }
 
+/**
+ * Hard ceiling on the reconciled union (B-16).
+ *
+ * Kite enforces ~3,000 tokens per connection on THEIR side, and exceeding it
+ * does not fail loudly: the ticker simply stops delivering some contracts. That
+ * surfaces much later as null Greeks and a rejected day-open on an apparently
+ * random instrument, which is close to undiagnosable from the symptom.
+ *
+ * vegaTimeseriesService.ensureSubscriptions() already truncates its OWN standing
+ * set at TOKEN_BUDGET, but browser option-chain selections are ref-counted on
+ * top of it with no cap at all (~83 tokens per distinct {symbol, expiry}), so
+ * roughly thirteen browsers on different chains could push the union past the
+ * limit. Truncating here converts silent broker-side corruption into a
+ * deterministic, logged, observable drop.
+ *
+ * PRIORITY, highest first:
+ *   1. index spot tokens  — the chain is useless without a live spot, and there
+ *                           are only five of them
+ *   2. standing sets      — the headless recorder, which nobody is watching and
+ *                           which therefore cannot recover by itself
+ *   3. client selections  — a live viewer notices a missing chain immediately
+ *                           and can re-select
+ */
+const HARD_TOKEN_CAP = Math.max(
+  500,
+  Math.min(Number(process.env.KITE_TOKEN_CAP) || 2900, 3000)
+);
+
+let lastDropped = 0;
+
 function reconcile() {
   const union = new Set(SUBSCRIBED_TOKENS);
-  for (const token of refCounts.keys()) union.add(token);
   for (const set of standingSets.values()) {
     for (const token of set) union.add(token);
   }
 
-  const tokens = [...union];
-  if (tokens.length > 2900) {
-    console.warn(
-      `[Subscriptions] ${tokens.length} tokens — approaching Kite's per-connection limit. ` +
-      'Reduce OPTION_STRIKE_WINDOW or shard across a second connection.'
-    );
+  let tokens = [...union];
+  let dropped = 0;
+
+  // Client selections are added last so they are the first thing dropped.
+  for (const token of refCounts.keys()) {
+    if (union.has(token)) continue;
+    if (tokens.length >= HARD_TOKEN_CAP) { dropped += 1; continue; }
+    union.add(token);
+    tokens.push(token);
+  }
+
+  // Even the priority set can exceed the cap on a badly over-configured
+  // recorder. Truncate rather than hand Kite a set it will silently mangle.
+  if (tokens.length > HARD_TOKEN_CAP) {
+    dropped += tokens.length - HARD_TOKEN_CAP;
+    tokens = tokens.slice(0, HARD_TOKEN_CAP);
+  }
+
+  if (dropped !== lastDropped) {
+    lastDropped = dropped;
+    if (dropped) {
+      console.warn(
+        `[Subscriptions] ${dropped} token(s) dropped at the ${HARD_TOKEN_CAP} cap — ` +
+        'some option-chain views will not receive ticks. Reduce OPTION_STRIKE_WINDOW, ' +
+        'VEGA_STRIKE_WINDOW or VEGA_EXPIRY_COUNT, or shard across a second connection.'
+      );
+    } else {
+      console.log('[Subscriptions] Back within the token cap — nothing dropped.');
+    }
   }
 
   updateSubscription(tokens);
@@ -156,6 +208,10 @@ function getStats() {
     clientTokens: refCounts.size,
     standing: Object.fromEntries([...standingSets].map(([k, v]) => [k, v.length])),
     strikeWindow: STRIKE_WINDOW,
+    // Surfaced so /api/vega/status shows the cap being hit instead of leaving
+    // it to be inferred from missing Greeks hours later (B-16).
+    tokenCap: HARD_TOKEN_CAP,
+    droppedTokens: lastDropped,
   };
 }
 

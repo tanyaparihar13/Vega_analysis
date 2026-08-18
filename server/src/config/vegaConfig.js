@@ -12,6 +12,7 @@
  */
 
 const nifty50 = require('../constants/nifty50');
+const instruments = require('../constants/instruments');
 
 const DELTA_START = {
   // Per-underlying delta floor. PHP's addvega.php only ever had one `start`
@@ -70,9 +71,29 @@ const TREND = {
   NEUTRAL: { key: 'neutral', label: 'Neutral', color: '#64748b' },
 };
 
+/**
+ * THE delta floor for one underlying — the single definition (B-06).
+ *
+ * vegaTimeseriesService.startFor() delegates here, optionChainService emits it
+ * on every chain payload, and the option-chain table filters on what it is
+ * given. Previously the client carried its own hardcoded copy which had drifted
+ * (stock floor 0.05 vs the server's 0.20, ceiling pinned at 0.60 while the
+ * server's is env-tunable), so the table and the Vega sums were built from
+ * different baskets for the same instrument.
+ *
+ * Curated indices keep their per-name floors; everything else is an F&O stock
+ * and gets STOCK_START.
+ */
+function deltaStartFor(symbol) {
+  const key = String(symbol || '').toUpperCase();
+  if (DELTA_START[key] != null) return DELTA_START[key];
+  return instruments.getUnderlying(key) ? 0.05 : module.exports.STOCK_START;
+}
+
 module.exports = {
   DELTA_START,
   DEFAULT_START: 0.05,
+  deltaStartFor,
 
   /**
    * Delta floor for F&O STOCKS (parity item 5).
@@ -241,6 +262,10 @@ module.exports = {
   TIMEFRAMES: {
     '5s': 5, '10s': 10, '15s': 15, '30s': 30,
     '1m': 60, '3m': 180, '5m': 300, '10m': 600, '15m': 900,
+    // 30m and 1h are servable from 5s rows (1800 % 5 === 0, 3600 % 5 === 0) and
+    // from 1m rows, so canServe() admits them for every stored resolution the
+    // recorder produces. Added because a desk reads the session shape on 30m.
+    '30m': 1800, '1h': 3600,
   },
 
   /**

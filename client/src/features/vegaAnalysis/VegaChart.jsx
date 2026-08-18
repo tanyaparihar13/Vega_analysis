@@ -505,7 +505,26 @@ function VegaChart({
       points.length === prev.len + 1 &&
       last > prev.lastTime;
 
-    if (isAppend) {
+    /**
+     * Same series, same length, same last timestamp -> the OPEN BUCKET was
+     * revised (B-01).
+     *
+     * The server now emits every 5s sample stamped with its bucket's start, so
+     * on any timeframe coarser than 5s the newest point is rewritten in place
+     * repeatedly while the bucket fills. Without this branch that fell through
+     * to the full `setData` + `fitContent()` below — rebuilding all three series
+     * and resetting the user's zoom every five seconds.
+     *
+     * lightweight-charts' `update()` REPLACES the bar when the timestamp already
+     * exists, which is exactly the semantics needed here.
+     */
+    const isRevision =
+      prev.len > 0 &&
+      prev.firstTime === first &&
+      points.length === prev.len &&
+      last === prev.lastTime;
+
+    if (isAppend || isRevision) {
       const p = points[points.length - 1];
       if (p.callVegaDiff != null) s.call.update({ time: p.time, value: Number(p.callVegaDiff) });
       if (p.putVegaDiff != null) s.put.update({ time: p.time, value: Number(p.putVegaDiff) });

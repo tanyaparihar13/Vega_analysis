@@ -77,7 +77,9 @@ router.get('/option-chain/:underlying', authenticate, requirePremium, (req, res)
 // got before.
 router.get('/vega-analysis/:underlying', authenticate, requirePremium, (req, res) => {
   try {
-    const cfgU = getUnderlying(req.params.underlying);
+    // B-05: stocks resolve here too; the curated table is still checked first.
+    const cfgU = instrumentService.resolveUnderlying(req.params.underlying)
+      || getUnderlying(req.params.underlying);
     if (!cfgU) return res.status(404).json({ message: `Unknown symbol: ${req.params.underlying}` });
 
     const tick = latestTicks.get(cfgU.spotToken);

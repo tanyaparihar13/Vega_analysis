@@ -645,6 +645,46 @@ function getNearestFuture(symbol) {
   return bucket.futures.get(nearest) || null;
 }
 
+/**
+ * The future to price ONE option expiry against (B-02).
+ *
+ * getNearestFuture() returns the front month for every caller, regardless of
+ * which option expiry is being priced. Index options are WEEKLY and index
+ * futures are MONTHLY, so a 7-day option was being priced against a forward
+ * maturing up to three weeks later — a ~90-point error at NIFTY 24,000, which
+ * biases delta by ~0.07 and therefore changes which strikes enter the Call/Put
+ * Vega sums.
+ *
+ * Returns the exact-expiry future where one is listed (always true for stocks,
+ * whose options and futures share monthly expiries, and for an index's monthly
+ * series). Otherwise returns the nearest one PLUS its own expiry, so the caller
+ * can carry the traded price back to the option's maturity rather than using it
+ * raw. Carrying the traded future back is preferred to rebuilding from spot
+ * because it preserves the market's own view of carry and basis.
+ *
+ * @returns {{row: object, exact: boolean, futureExpiry: string}|null}
+ */
+function getFutureForExpiry(symbol, expiry) {
+  const cfg = resolveUnderlying(symbol);
+  if (!cfg) return null;
+  const bucket = byUnderlying.get(cfg.instrumentName.toUpperCase());
+  if (!bucket || !bucket.futures.size) return null;
+
+  const wanted = toExpiryKey(expiry);
+  if (wanted && bucket.futures.has(wanted)) {
+    return { row: bucket.futures.get(wanted), exact: true, futureExpiry: wanted };
+  }
+
+  // Nearest future that still settles ON or AFTER the option — carrying a price
+  // BACKWARDS in time is discounting, carrying it forwards is extrapolation, and
+  // only the former is sound. Falls back to the front month when the option
+  // outlives every listed future, and the caller treats that as unusable.
+  const keys = [...bucket.futures.keys()].sort();
+  const onOrAfter = wanted ? keys.find((k) => k >= wanted) : keys[0];
+  const chosen = onOrAfter || keys[0];
+  return { row: bucket.futures.get(chosen), exact: false, futureExpiry: chosen };
+}
+
 function getInstrument(token) {
   return byToken.get(Number(token)) || null;
 }
@@ -729,6 +769,7 @@ module.exports = {
   selectStrikes,
   getTokensForExpiry,
   getNearestFuture,
+  getFutureForExpiry,
 
   // lookups
   getInstrument,

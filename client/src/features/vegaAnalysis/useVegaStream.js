@@ -34,6 +34,9 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
   const [points, setPoints] = useState([]);
   const [meta, setMeta] = useState(null);
   const [error, setError] = useState(null);
+  // Soft, non-alarming state for "this selection has no live stream" (B-04).
+  // Distinct from `error`, which means something actually failed.
+  const [notice, setNotice] = useState(null);
   /**
    * True from the moment the selection changes until the server's back-fill for
    * the NEW selection lands.
@@ -62,7 +65,9 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
       if (!want.symbol) return;
 
       if (msg.type === 'vega_error') {
+        if (msg.symbol && msg.symbol !== want.symbol) return;
         setError(msg.message || 'Live Vega is unavailable');
+        setNotice(null);
         // A failed switch must not leave the PREVIOUS instrument's curve on
         // screen under the new instrument's name — that would be worse than an
         // empty chart, because it looks like real data. Drop it and let the
@@ -73,9 +78,41 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
         return;
       }
 
-      if (msg.type === 'vega_subscribed') {
-        if (msg.symbol !== want.symbol || msg.timeframe !== want.timeframe) return;
+      /**
+       * NO LIVE STREAM FOR THIS SELECTION — not an error (B-04).
+       *
+       * The server refuses rather than substituting another expiry. Drop the
+       * socket series so `streamHealthy` goes false in the page component and
+       * the REST path takes over: it filters expiry exactly and returns an
+       * honest empty state when that contract has no rows.
+       */
+      if (msg.type === 'vega_unavailable') {
+        if (msg.symbol !== want.symbol) return;
+        setSwitching(false);
+        setPoints([]);
+        setMeta(null);
+        setNotice(msg.message || 'No live series for this selection.');
         setError(null);
+        return;
+      }
+
+      if (msg.type === 'vega_subscribed') {
+        /**
+         * EXPIRY IS PART OF THE IDENTITY OF THIS SERIES (B-04).
+         *
+         * This check used to compare symbol and timeframe only. Combined with
+         * the server's silent `expiries[0]` fallback, that let another expiry's
+         * back-fill be accepted and painted under the selected expiry's label —
+         * and since `vega_point` below IS expiry-filtered, no live point ever
+         * matched afterwards, so the wrong curve sat frozen on screen looking
+         * like real data. All three fields must match or the payload is not
+         * ours.
+         */
+        if (msg.symbol !== want.symbol
+          || msg.expiry !== want.expiry
+          || msg.timeframe !== want.timeframe) return;
+        setError(null);
+        setNotice(null);
         setSwitching(false);
         setMeta({
           symbol: msg.symbol,
@@ -97,12 +134,22 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
         const incoming = msg.point;
         if (!incoming) return;
 
+        /**
+         * THIS REDUCER IS THE LIVE AGGREGATOR (B-01).
+         *
+         * The server now emits EVERY 5s sample stamped with its bucket's start
+         * time, so the same timestamp arrives repeatedly while a bucket fills.
+         * Replacing in place means the value held for a bucket is always the
+         * LATEST sample seen in it — and once the bucket closes, that is the
+         * LAST sample, which is exactly what bucketByTimeframe() stores and
+         * what a page reload returns.
+         *
+         * Live and history therefore converge by construction rather than by
+         * two functions happening to agree. (Before this, the server sent only
+         * the first sample of each bucket and this branch was unreachable.)
+         */
         setPoints((prev) => {
           const last = prev[prev.length - 1];
-          // Points are stamped with their BUCKET's start time, so a coarse
-          // timeframe re-sends the same timestamp as the bucket fills. Replace
-          // in place rather than appending, or a 15m chart would grow a
-          // duplicate x value every push.
           if (last && last.time === incoming.time) {
             const next = prev.slice(0, -1);
             next.push(incoming);
@@ -122,12 +169,14 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
     if (!enabled || !symbol || !timeframe) {
       setPoints([]);
       setMeta(null);
+      setNotice(null);
       setSwitching(false);
       return undefined;
     }
 
     marketSocket.connect();
     setError(null);
+    setNotice(null);
 
     /**
      * DELIBERATELY DOES NOT CLEAR `points` OR `meta`.
@@ -156,5 +205,5 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
     };
   }, [symbol, expiry, timeframe, enabled]);
 
-  return { points, meta, error, switching };
+  return { points, meta, error, notice, switching };
 }

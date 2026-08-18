@@ -55,100 +55,153 @@ function reportKiteConfig() {
 
 
 /**
- * Boot order:
- *   0. Migrations — every table this process touches must exist first.
- *      (oauth_states in particular; without it, connecting Zerodha 500s.)
- *   0b. Admin bootstrap — without an admin, NOTHING works: the Zerodha
- *      connect flow is admin-only, so no admin means no access token, which
- *      means no ticks, no instruments, no chain and no vega. See seedAdmin.js.
- *   1. HTTP listen
- *   2. WebSocket server + market feed
- *   3. Restore + VERIFY the stored Kite token
- *   4. Instrument master — from Kite if authenticated, else from the MySQL
- *      cache so the chain still works before an admin reconnects
- *   5. Option chain stream, OI baseline, IV history
+ * ===========================================================================
+ * BOOT ORDER — THE PORT BINDS FIRST (A-01)
+ * ===========================================================================
+ * This used to run migrations and the admin seed BEFORE server.listen(), then
+ * perform six more awaited steps with no individual error handling, under a
+ * single terminal `.catch` that called process.exit(1). Two consequences, both
+ * of which present identically to a user: `502 Bad Gateway` from Nginx, because
+ * nothing is listening on 127.0.0.1:5000.
  *
- * Steps 3-5 degrade gracefully. The API keeps serving auth and admin routes
- * regardless, and chain endpoints report 503 until instruments are available.
+ *   1. Anything that threw before listen() meant the port never bound at all.
+ *   2. Anything that threw AFTER listen() killed a server that was already
+ *      up and serving — restoreSession(), verifySession(),
+ *      optionStreamService.init() and vegaTimeseriesService.start() were all
+ *      unguarded.
+ *
+ * The order is now: bind the port, then bring subsystems up one at a time, each
+ * inside its own guard. A failure degrades that subsystem and nothing else.
+ * /api/health answers from the moment the port is bound, and /api/health/deep
+ * reports exactly which subsystem is unhappy — so "the backend is down" and
+ * "MySQL is down" stop looking like the same event.
+ *
+ * Degradation is honest, not silent: chain and vega endpoints return 503 with a
+ * reason until instruments are available, and the admin panel can read
+ * /api/health/deep.
  */
-(async function boot() {
-  // ---- 0. Migrations ----------------------------------------------------
+
+/** Run one boot step; never let it take the process down. */
+async function step(name, fn) {
   try {
-    await migrate.run({ verbose: true });
+    return await fn();
   } catch (err) {
-    // Do not exit. A DB that is briefly unreachable should not stop the
-    // process from coming up — config/db.js retries per query, and an admin
-    // can re-run `npm run db:migrate`.
-    console.error('[Boot] Migrations failed — continuing, but tables may be missing:', err.message);
+    console.error(`[Boot] ${name} failed — continuing degraded:`, err.message);
+    return null;
   }
+}
 
-  // ---- 0b. Admin bootstrap ----------------------------------------------
-  // Idempotent and non-fatal — logs and continues if the DB is unreachable.
-  await seedAdmin.run({ verbose: true });
+let listening = false;
 
-  // ---- 1. Listen --------------------------------------------------------
-  await new Promise((resolve) => {
+(async function boot() {
+  // ---- 1. LISTEN FIRST --------------------------------------------------
+  // Nothing above this line. The port is the one thing that must exist for the
+  // reverse proxy to stop returning 502.
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
     server.listen(PORT, () => {
-      console.log(`[Vega Analysis] API + WebSocket server running on port ${PORT}`);
+      listening = true;
+      console.log(`[Vega Analysis] API + WebSocket server listening on port ${PORT}`);
       resolve();
     });
   });
 
-  // ---- 2. Market feed ---------------------------------------------------
-  await startMarketFeed(server).catch((err) => {
-    console.warn('[Market Feed] Not started yet:', err.message);
-  });
+  // ---- 2. Migrations ----------------------------------------------------
+  await step('Migrations', () => migrate.run({ verbose: true }));
 
-  optionStreamService.init(latestTicks);
+  // ---- 3. Admin bootstrap ----------------------------------------------
+  // Without an admin, NOTHING works: the Zerodha connect flow is admin-only,
+  // so no admin means no access token, no ticks, no instruments, no vega.
+  await step('Admin bootstrap', () => seedAdmin.run({ verbose: true }));
 
-  // ---- 3. Restore + verify the Kite session -----------------------------
+  // ---- 4. Market feed + streams ----------------------------------------
+  await step('Market feed', () => startMarketFeed(server));
+  await step('Option/Vega stream', () => optionStreamService.init(latestTicks));
+
+  // ---- 5. Restore + verify the Kite session -----------------------------
   reportKiteConfig();
 
-  let authenticated = false;
-  if (await restoreSession()) {
+  const authenticated = await step('Kite session', async () => {
     // restoreSession only proves a row exists and has not passed its stored
     // expiry. It does NOT prove Kite still honours the token — logging into
     // Kite from a phone kills the server's token immediately, and expires_at
     // knows nothing about that. One getProfile() call settles it before we
     // subscribe a ticker that would 403 thirty seconds later.
-    const verified = await verifySession();
-    authenticated = verified.valid;
-  }
+    if (!(await restoreSession())) return false;
+    return (await verifySession()).valid;
+  });
 
-  // ---- 4. Instrument master --------------------------------------------
-  if (authenticated) {
-    try {
-      await instrumentService.refresh(kc);
-      instrumentService.scheduleDailyRefresh(kc);
-    } catch (err) {
-      console.error('[Instruments] Kite refresh failed, falling back to MySQL cache:', err.message);
-      await instrumentService.loadFromDatabase();
+  // ---- 6. Instrument master --------------------------------------------
+  await step('Instrument master', async () => {
+    if (authenticated) {
+      try {
+        await instrumentService.refresh(kc);
+        instrumentService.scheduleDailyRefresh(kc);
+        return;
+      } catch (err) {
+        console.error('[Instruments] Kite refresh failed, falling back to MySQL cache:', err.message);
+      }
     }
-  } else {
-    // No live session. Contracts do not change intraday, so yesterday's master
-    // is still correct — load it so the chain renders (with stale prices and a
-    // clear "feed down" banner) instead of showing an empty page.
+    // No live session (or the refresh failed). Contracts do not change
+    // intraday, so yesterday's master is still correct — load it so the chain
+    // renders (with stale prices and a clear "feed down" banner) instead of an
+    // empty page.
     const restored = await instrumentService.loadFromDatabase();
     console.log(
       restored
         ? '[Instruments] Serving from MySQL cache — admin must connect Zerodha for live prices.'
         : '[Instruments] No cache available. Waiting for an admin to connect Zerodha.'
     );
-  }
+  });
 
-  // ---- 5. Derived-data caches ------------------------------------------
-  await oiBaselineService.loadBaseline();
-  await oiBaselineService.loadAllIvHistory(Object.keys(UNDERLYINGS));
+  // ---- 7. Derived-data caches ------------------------------------------
+  await step('OI baseline', () => oiBaselineService.loadBaseline());
+  await step('IV history', () => oiBaselineService.loadAllIvHistory(Object.keys(UNDERLYINGS)));
 
-await vegaTimeseriesService.loadToday();
-vegaTimeseriesService.start(latestTicks);
-
-
+  // ---- 8. Vega recorder -------------------------------------------------
+  // loadToday() restores today's baselines and buffered samples from MySQL, so
+  // a restart mid-session resumes rather than starting blank. It is the reason
+  // history survives a PM2/Docker restart with at most one sample lost.
+  await step('Vega history restore', () => vegaTimeseriesService.loadToday());
+  await step('Vega sampler', () => vegaTimeseriesService.start(latestTicks));
 
   console.log('[Boot] Startup complete.');
 })().catch((err) => {
-  console.error('[Boot] Fatal startup error:', err);
-  process.exit(1);
+  /**
+   * Only a failure to BIND is fatal now. Everything after that point has its
+   * own guard, so reaching here with the socket open would mean exiting a
+   * server that is answering requests — which is precisely how a recoverable
+   * subsystem fault turned into a 502.
+   */
+  if (!listening) {
+    console.error('[Boot] Could not bind the port — exiting:', err.message);
+    process.exit(1);
+  }
+  console.error('[Boot] Startup error after listen — continuing degraded:', err);
+});
+
+/**
+ * ===========================================================================
+ * KEEP THE PROCESS ALIVE (A-02)
+ * ===========================================================================
+ * Node >= 15 TERMINATES the process on an unhandled promise rejection. This app
+ * holds a broker socket, five cron jobs, a 1 Hz push loop and a 5-second
+ * sampler; a single floating promise anywhere in that machinery would kill a
+ * healthy server, and the only externally visible symptom is a 502.
+ *
+ * Logging and continuing is the right trade for a read-only market-data
+ * service: no request handler mutates shared state in a way that a mid-flight
+ * abort could corrupt, and MySQL writes are individually transactional. An
+ * uncaught exception is logged with its stack so the cause is recoverable from
+ * the log rather than inferred from the absence of a process.
+ */
+process.on('unhandledRejection', (reason) => {
+  console.error('[Process] Unhandled promise rejection — continuing:',
+    reason instanceof Error ? reason.stack : reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[Process] Uncaught exception — continuing:', err?.stack || err);
 });
 
 /**

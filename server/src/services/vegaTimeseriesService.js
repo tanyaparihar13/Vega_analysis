@@ -164,9 +164,9 @@ function stateKey(symbol, expiry) {
  * filtered differently.
  */
 function startFor(symbol) {
-  const key = String(symbol || '').toUpperCase();
-  if (cfg.DELTA_START[key] != null) return cfg.DELTA_START[key];
-  return isIndex(key) ? cfg.DEFAULT_START : cfg.STOCK_START;
+  // B-06: delegates to vegaConfig.deltaStartFor so the Vega sums, the chain
+  // payload and the option-chain table all read ONE definition of the band.
+  return cfg.deltaStartFor(symbol);
 }
 
 /** Strikes either side of ATM to build/subscribe. Stocks use a tighter board. */
@@ -878,6 +878,23 @@ function decorate(p) {
     trend: t.label,
     trendKey: t.key,
     trendColor: t.color,
+    /**
+     * B-08: state the convention rather than leaving it to be inferred.
+     *
+     * The three plotted series are multiplied by DISPLAY_SIGN (-1 by default)
+     * while the trend is classified from the UNFLIPPED values. That is
+     * deliberate — the datav1.php rules are stated in the engine's economic
+     * convention, where calls gaining vega while puts lose it is a rally and
+     * therefore Bullish — but the visible consequence is that a RISING green
+     * Call Vega line accompanies a 'Bearish' pill, which reads as a
+     * contradiction to anyone who has not been told.
+     *
+     * The maths is NOT changed here: inverting the trend would relabel every
+     * historical point, and whether it should be inverted is a parity question
+     * about the reference platform, not a question this code can answer. This
+     * field lets the UI explain the relationship instead.
+     */
+    trendConvention: s === -1 ? 'series-inverted' : 'series-raw',
   };
 }
 
@@ -920,18 +937,42 @@ function dayOpenSummaryFromPoints(points) {
  */
 function bucketByTimeframe(points, timeframe = '1m') {
   const seconds = tfSeconds(timeframe) || 60;
-  if (points.length < 2) return points;
+  /**
+   * NO EARLY RETURN FOR A SINGLE POINT (B-10).
+   *
+   * `if (points.length < 2) return points;` handed the caller an UNBUCKETED
+   * point: the session's first sample kept its raw 5s timestamp instead of its
+   * bucket start, then jumped onto the boundary the moment a second sample
+   * arrived. That jump changes `firstTime`, which defeats VegaChart's append
+   * heuristic and forces a full setData + axis re-fit — so the first minute of
+   * every session visibly flickered. The loop below already handles a
+   * single-element array correctly, so the special case was never needed.
+   */
+  if (!points.length) return points;
   const out = [];
   let bucket = null;
   let last = null;
   for (const p of points) {
-    const b = Math.floor(p.time / seconds) * seconds;
+    const b = bucketStartFor(p.time, timeframe);
     if (bucket !== null && b !== bucket) out.push({ ...last, time: bucket });
     bucket = b;
     last = p;
   }
   if (last) out.push({ ...last, time: bucket });
   return out;
+}
+
+/**
+ * THE bucket rule (B-01). One definition, used by the historical aggregator
+ * above AND by the live WebSocket push in vegaStreamService.
+ *
+ * Boundaries are absolute against the UNIX epoch, so they are stable across
+ * days, instruments and process restarts — two servers bucketing the same
+ * sample always agree.
+ */
+function bucketStartFor(time, timeframe = '1m') {
+  const seconds = tfSeconds(timeframe) || 60;
+  return Math.floor(Number(time) / seconds) * seconds;
 }
 
 /** Which stored resolutions exist for one {symbol, date, expiry}. */
@@ -1214,6 +1255,24 @@ async function loadDelayed(symbol, { delayMinutes = PUBLIC_DELAY_MINUTES, timefr
       await storedResolutions(key, today, frontExpiry), timeframe
     );
 
+    /**
+     * B-09: when NO stored resolution can build this timeframe, do NOT fall
+     * through with a null filter.
+     *
+     * `(:resolution IS NULL OR resolution = :resolution)` becomes a no-op on
+     * null, which reads EVERY resolution together — the exact doubling the note
+     * above warns about, and the one bucketByTimeframe would then hide behind
+     * last-value-wins. An honest empty answer is the correct one: a 1m row
+     * genuinely cannot be split into a 15s bar.
+     */
+    if (!dayResolution) {
+      return {
+        date: today, expiry: frontExpiry, points: [], delayMinutes: minutes,
+        isFallbackDay: false, asOf: null,
+        unavailable: { reason: 'resolution', timeframe },
+      };
+    }
+
     const [rows] = await db.query(
       `SELECT sampled_at, call_vega_diff, put_vega_diff, vega_diff,
               current_call_vega, current_put_vega, open_call_vega, open_put_vega,
@@ -1254,10 +1313,17 @@ async function loadDelayed(symbol, { delayMinutes = PUBLIC_DELAY_MINUTES, timefr
   );
   const fallbackExpiry = expiryKey(fallbackFront?.e);
 
-  // Same one-resolution rule as the live path above.
+  // Same one-resolution rule — and the same refusal to drop it (B-09).
   const fallbackResolution = pickResolution(
     await storedResolutions(key, fallbackDate, fallbackExpiry), timeframe
   );
+  if (!fallbackResolution) {
+    return {
+      date: fallbackDate, expiry: fallbackExpiry, points: [], delayMinutes: minutes,
+      isFallbackDay: true, asOf: null,
+      unavailable: { reason: 'resolution', timeframe },
+    };
+  }
   const points = await readStoredPoints(key, fallbackDate, timeframe, fallbackExpiry, fallbackResolution);
   return {
     date: fallbackDate, expiry: fallbackExpiry, points, delayMinutes: minutes,
@@ -1375,6 +1441,11 @@ function getStats() {
     instrumentsReady: instrumentService.isReady(),
     subscription: subscriptionManager.getStats(),
     filterMode: 'abs',
+    // Which pricing/identifiability rules are live, so /api/vega/status answers
+    // "what produced these numbers" without reading the environment by hand.
+    forwardMode: process.env.VEGA_FORWARD_MODE === 'matched' ? 'matched' : 'nearest',
+    ivIdentifiability: require('../utils/impliedVolatility').IDENTIFIABILITY_MODE,
+    trendConvention: cfg.DISPLAY_SIGN === -1 ? 'series-inverted' : 'series-raw',
     strikeMode: cfg.STRIKE_MODE,
     strikeHysteresis: cfg.STRIKE_HYSTERESIS,
     // -1 means the served series are the negation of the stored PHP-signed
@@ -1450,7 +1521,7 @@ module.exports = {
   listExpiries, resolveExpiry, trackedExpiries, defaultLiveExpiry,
   registerDemand, releaseDemand, onTick,
   resolveSymbol, isIndex, persistResolutionFor, canServe, servableTimeframes,
-  storedResolutions, bucketByTimeframe,
+  storedResolutions, bucketByTimeframe, bucketStartFor,
   loadDelayed, PUBLIC_DELAY_MINUTES,
   // Exported so the WebSocket push uses the SAME sign convention and trend
   // derivation as every other reader — see decorate()'s header.

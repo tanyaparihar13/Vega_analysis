@@ -1,0 +1,42 @@
+# systemd alternative to PM2 — installs nothing extra.
+#
+#   sudo cp deploy/vega-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vega-api
+#   journalctl -u vega-api -f
+#
+# Same constraint as the PM2 file: ONE process. Do not template this unit.
+
+[Unit]
+Description=Vega Analysis API (Express + WebSocket + Kite ticker)
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/var/www/vega-analysis/server
+ExecStart=/usr/bin/node src/index.js
+
+Environment=NODE_ENV=production
+# Keeps MySQL NOW(), the journal timestamps and the app's IST cron schedules in
+# one frame of reference.
+Environment=TZ=Asia/Kolkata
+EnvironmentFile=/var/www/vega-analysis/server/.env
+
+Restart=always
+RestartSec=5
+# Give up after 10 failures in 5 minutes rather than looping forever on a
+# broken config — a stopped unit is diagnosable, a crash loop is noise.
+StartLimitBurst=10
+StartLimitIntervalSec=300
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vega-api
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

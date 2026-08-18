@@ -119,11 +119,61 @@ async function handleSubscribe(client, { symbol, expiry, timeframe }) {
 
     const tf = cfg.TIMEFRAMES[timeframe] ? timeframe : DEFAULT_TIMEFRAME;
 
+    /**
+     * =====================================================================
+     * NEVER SUBSTITUTE THE EXPIRY (B-04)
+     * =====================================================================
+     * This used to be:
+     *
+     *     const chosen = expiry && expiries.includes(...) ? ... : expiries[0];
+     *
+     * so asking for an expiry the recorder is not tracking silently returned a
+     * DIFFERENT contract's series. The client then painted it under the
+     * selected expiry's label — and because `vega_point` is expiry-filtered,
+     * no live point ever matched afterwards, leaving a wrong-expiry curve
+     * frozen on screen for the rest of the session. That is strictly worse
+     * than an empty chart, because it looks like real data.
+     *
+     * A requested expiry is now honoured exactly or refused explicitly. The
+     * refusal is `vega_unavailable`, not `vega_error`: nothing is broken, this
+     * contract simply has no LIVE stream. The client drops the socket series on
+     * that message, which lets the REST path — which already filters expiry
+     * correctly and returns an honest empty state — take over.
+     */
+    const requested = expiry ? String(expiry).slice(0, 10) : null;
     const expiries = vegaTimeseriesService.trackedExpiries(cfgU.key);
-    const chosen = expiry && expiries.includes(String(expiry).slice(0, 10))
-      ? String(expiry).slice(0, 10)
-      : expiries[0];
-    if (!chosen) throw new Error(`No live expiries for ${cfgU.key}`);
+
+    if (requested && !expiries.includes(requested)) {
+      sendToClient(client, {
+        type: 'vega_unavailable',
+        symbol: cfgU.key,
+        expiry: requested,
+        expiries,
+        reason: 'expiry-not-tracked',
+        message: expiries.length
+          ? `${cfgU.key} ${requested} is not being recorded live. Tracked right now: ${expiries.join(', ')}.`
+          : `${cfgU.key} has no live expiries right now.`,
+      });
+      // Drop any previous selection for this client so the sampler is not left
+      // producing a series nobody is watching.
+      releaseClient(client);
+      return;
+    }
+
+    // Only an ABSENT expiry falls back, and only to the nearest tracked one.
+    const chosen = requested || expiries[0];
+    if (!chosen) {
+      sendToClient(client, {
+        type: 'vega_unavailable',
+        symbol: cfgU.key,
+        expiry: null,
+        expiries: [],
+        reason: 'no-expiries',
+        message: `No live expiries for ${cfgU.key}.`,
+      });
+      releaseClient(client);
+      return;
+    }
 
     // Tell the sampler to start producing this series, and subscribe the ticker
     // tokens behind it. `changed` is false when the client re-sent what it
@@ -267,11 +317,36 @@ function handleSamplerTick(updated) {
     const point = bySeries.get(`${session.symbol}|${session.expiry}`);
     if (!point) continue;
 
-    const seconds = cfg.TIMEFRAMES[session.timeframe] || 5;
-    const bucket = Math.floor(point.time / seconds) * seconds;
-
-    // Emit once per timeframe period: 5s -> every 5s, 15m -> every 15 minutes.
-    if (session.lastBucket === bucket) continue;
+    /**
+     * ===================================================================
+     * EMIT EVERY SAMPLE, STAMPED WITH ITS BUCKET START (B-01)
+     * ===================================================================
+     * This used to suppress every sample after the first in a bucket:
+     *
+     *     if (session.lastBucket === bucket) continue;
+     *
+     * which meant the client received the FIRST 5s sample of each bucket while
+     * bucketByTimeframe() — the function behind the REST series, the WebSocket
+     * back-fill and the Excel export — keeps the LAST. The two disagreed by
+     * whatever the vega moved inside the bucket: measured at 111 (history) vs
+     * 100 (live) on a single 1m bar. Worse, the in-progress bar never updated
+     * at all, so a 15m chart showed a value up to fifteen minutes stale and a
+     * reload silently corrected it.
+     *
+     * Emitting every sample with the bucket's start time makes the client's
+     * replace-in-place rule (useVegaStream) the aggregator, and last-value-wins
+     * falls out of it — identical to the historical path by construction rather
+     * than by two functions agreeing to agree. It also makes the in-progress
+     * bucket live, which is what a running chart is for.
+     *
+     * `lastBucket` is retained for diagnostics and for the client-side
+     * transition reset; it no longer gates anything.
+     *
+     * COST: one message per client per 5s (~200 bytes) instead of one per
+     * bucket. On a 15m chart that is 180x more messages and ~40 B/s.
+     */
+    const bucket = vegaTimeseriesService.bucketStartFor(point.time, session.timeframe);
+    const bucketAdvanced = session.lastBucket !== bucket;
     session.lastBucket = bucket;
 
     sendToClient(client, {
@@ -279,6 +354,10 @@ function handleSamplerTick(updated) {
       symbol: session.symbol,
       expiry: session.expiry,
       timeframe: session.timeframe,
+      // True on the first sample of a new bucket. The client uses it only to
+      // distinguish "append a bar" from "revise the open bar"; correctness does
+      // not depend on it, because the timestamps already say which is which.
+      bucketAdvanced,
       // Stamped with the BUCKET's start time, matching the historical
       // aggregator, so live and reloaded charts land on identical x values.
       point: { ...decorateForWire(point), time: bucket },
@@ -308,4 +387,15 @@ function getStats() {
   };
 }
 
-module.exports = { init, stop, handleMessage, releaseClient, getStats };
+module.exports = {
+  init, stop, handleMessage, releaseClient, getStats,
+  /**
+   * Test seam — exported so the live/history convergence guarantee (B-01) can be
+   * asserted against the REAL emit path rather than a copy of it in a test file.
+   * A copy would keep passing after someone reintroduced the bucket suppression,
+   * which is exactly the regression this seam exists to catch.
+   *
+   * Not referenced anywhere in application code.
+   */
+  __test: { handleSamplerTick, sessions },
+};

@@ -116,6 +116,16 @@ router.get('/:symbol/series', authenticate, requirePremium, async (req, res) => 
       // i.e. the StockMojo / Alpha Edge convention. Surfaced so a consumer can
       // tell which convention it received rather than having to assume one.
       displaySign: cfg.DISPLAY_SIGN,
+      /**
+       * B-08. 'series-inverted' means the three plotted series are the NEGATION
+       * of the stored values while `trend` is derived from the stored
+       * (un-negated) pair. The client uses this to explain why a rising Call
+       * Vega line can sit next to a Bearish label.
+       */
+      trendConvention: cfg.DISPLAY_SIGN === -1 ? 'series-inverted' : 'series-raw',
+      // Whether the requested expiry actually exists for this day. False means
+      // `points` is legitimately empty — not an error, and not another expiry.
+      expiryMatched: expiry ? available.some((e) => e.expiry === expiry) : null,
       hasBaseline,
       // The expiry these points belong to, plus what else was selectable for
       // this day — so the dropdown can stay populated from the same response

@@ -1,11 +1,65 @@
 const {
   calculateGreeks, calculateGreeks76, forwardFromSpot, yearsToExpiry,
+  discountForwardToExpiry,
 } = require('../utils/blackScholes');
 const { impliedVolatility, impliedVolatility76 } = require('../utils/impliedVolatility');
 const { getUnderlying } = require('../constants/instruments');
 const instrumentService = require('./instrumentService');
+const vegaCfg = require('../config/vegaConfig');
 
 const RISK_FREE_RATE = Number(process.env.RISK_FREE_RATE || 0.065);
+
+/**
+ * Which forward the Black-76 pricer is given (B-02).
+ *
+ *   'nearest'  the front-month future's traded price, whatever the option's
+ *              expiry. This is the behaviour that shipped, and it is the
+ *              DEFAULT so no stored financial result changes without an
+ *              explicit operator decision.
+ *   'matched'  the future that settles with the option where one is listed,
+ *              otherwise the nearest one discounted back to the option's own
+ *              maturity. Mathematically correct; see the header on
+ *              instrumentService.getFutureForExpiry().
+ *
+ * Set VEGA_FORWARD_MODE=matched to activate. Stocks are unaffected either way,
+ * because stock options and stock futures share monthly expiries and therefore
+ * always take the `exact` branch.
+ */
+const FORWARD_MODE =
+  String(process.env.VEGA_FORWARD_MODE || 'nearest').toLowerCase() === 'matched'
+    ? 'matched'
+    : 'nearest';
+
+/**
+ * Resolve the forward for one {underlying, expiry}.
+ * @returns {{forward: number|null, source: string|null, futureSymbol: string|null}}
+ */
+function resolveForward({ cfg, expiry, T, spot, latestTicks }) {
+  const carry = () => (spot != null
+    ? { forward: forwardFromSpot(spot, T, RISK_FREE_RATE), source: 'carry', futureSymbol: null }
+    : { forward: null, source: null, futureSymbol: null });
+
+  if (FORWARD_MODE === 'nearest') {
+    const future = instrumentService.getNearestFuture(cfg.key);
+    const price = future ? latestTicks.get(future.instrumentToken)?.lastPrice ?? null : null;
+    if (price != null) return { forward: price, source: 'future', futureSymbol: future.tradingsymbol };
+    return carry();
+  }
+
+  // --- matched ---
+  const pick = instrumentService.getFutureForExpiry(cfg.key, expiry);
+  const price = pick ? latestTicks.get(pick.row.instrumentToken)?.lastPrice ?? null : null;
+  if (price == null) return carry();
+
+  if (pick.exact) {
+    return { forward: price, source: 'future', futureSymbol: pick.row.tradingsymbol };
+  }
+
+  const tFuture = yearsToExpiry(pick.futureExpiry);
+  const discounted = discountForwardToExpiry(price, tFuture, T, RISK_FREE_RATE);
+  if (discounted == null) return carry(); // future settles before the option
+  return { forward: discounted, source: 'future-discounted', futureSymbol: pick.row.tradingsymbol };
+}
 
 /**
  * Builds one option chain snapshot from the live tick cache.
@@ -59,15 +113,8 @@ function buildChain({ symbol, expiry, latestTicks, oiBaseline = null, strikeWind
    *   1. the nearest future's traded price — the market's own forward
    *   2. S * e^(rT) — the no-arbitrage forward, when no future tick is cached
    */
-  const future = instrumentService.getNearestFuture(cfg.key);
-  const futureTick = future ? latestTicks.get(future.instrumentToken) : null;
-  const futurePrice = futureTick?.lastPrice ?? null;
-
-  const forward = futurePrice != null
-    ? futurePrice
-    : (spot != null ? forwardFromSpot(spot, T, RISK_FREE_RATE) : null);
-
-  const forwardSource = futurePrice != null ? 'future' : (spot != null ? 'carry' : null);
+  const { forward, source: forwardSource, futureSymbol } =
+    resolveForward({ cfg, expiry, T, spot, latestTicks });
 
   // ATM = listed strike closest to spot. Falls back to the middle of the board
   // before the first spot tick arrives, so the table still renders.
@@ -105,8 +152,20 @@ function buildChain({ symbol, expiry, latestTicks, oiBaseline = null, strikeWind
     // were actually priced against rather than assuming it was spot.
     pricingModel: 'black76',
     forward: forward != null ? Number(forward.toFixed(2)) : null,
-    forwardSource,                                   // 'future' | 'carry' | null
-    futureSymbol: future?.tradingsymbol ?? null,
+    // 'future' | 'future-discounted' | 'carry' | null
+    forwardSource,
+    forwardMode: FORWARD_MODE,
+    futureSymbol,
+    /**
+     * The |delta| band the Vega sums are built over, for THIS underlying (B-06).
+     *
+     * Emitted so the option-chain table can filter on the server's rule instead
+     * of re-implementing it. The client copy had drifted: its stock floor was
+     * 0.05 against the server's 0.20, and its ceiling was hardcoded 0.60 while
+     * the server's is env-tunable — so the table showed a different basket from
+     * the one the Vega chart was summing.
+     */
+    deltaBand: { start: vegaCfg.deltaStartFor(cfg.key), max: vegaCfg.DELTA_MAX },
     pcr: calculatePCR(chain),
     maxPain: calculateMaxPain(chain),
     atmIv: calculateAtmIv(atmRow),
@@ -126,6 +185,7 @@ function buildSide({ leg, type, strike, spot, forward, T, latestTicks, oiBaselin
     instrumentToken: leg.instrumentToken,
     tradingsymbol: leg.tradingsymbol,
     lotSize: leg.lotSize,
+    tickSize: leg.tickSize ?? null,
   };
 
   if (!tick) return { ...emptySide(type), ...base };
@@ -142,8 +202,14 @@ function buildSide({ leg, type, strike, spot, forward, T, latestTicks, oiBaselin
   // Solve IV from the traded price, then price the Greeks with it — both
   // against the FORWARD (Black-76), which is how Indian index options are
   // quoted. See the `forward` derivation in buildChain().
+  // tickSize is threaded so the identifiability rule can be expressed relative
+  // to how finely THIS contract is quoted (B-03). It is ignored in the default
+  // 'absolute' mode, so passing it changes nothing until that mode is switched.
   const iv = (ltp != null && forward != null && T > 0)
-    ? impliedVolatility76({ marketPrice: ltp, F: forward, K: strike, T, r: RISK_FREE_RATE, type })
+    ? impliedVolatility76({
+        marketPrice: ltp, F: forward, K: strike, T, r: RISK_FREE_RATE, type,
+        tickSize: leg.tickSize,
+      })
     : null;
 
   const greeks = (iv != null && forward != null)
@@ -192,7 +258,7 @@ function buildSide({ leg, type, strike, spot, forward, T, latestTicks, oiBaselin
 function emptySide(type) {
   return {
     type,
-    instrumentToken: null, tradingsymbol: null, lotSize: null,
+    instrumentToken: null, tradingsymbol: null, lotSize: null, tickSize: null,
     ltp: null, ltpChange: null, ltpPercentChange: null,
     oi: null, oiChange: null, oiChangePercent: null, volume: null,
     bidQty: null, bidPrice: null, askPrice: null, askQty: null,

@@ -68,9 +68,42 @@ function normalizeTick(tick) {
     lowerCircuitLimit: tick.lower_circuit_limit ?? null,
     upperCircuitLimit: tick.upper_circuit_limit ?? null,
 
-    timestamp:
-      tick.exchange_timestamp || tick.last_trade_time || new Date().toISOString(),
+    /**
+     * ONE TYPE (B-14).
+     *
+     * kiteconnect parses `exchange_timestamp` and `last_trade_time` into JS
+     * Date objects, but the fallback branch produced an ISO string — so this
+     * field was `Date | string` depending on which branch ran, and every
+     * consumer had to guess. Normalised to epoch MILLISECONDS: unambiguous,
+     * timezone-free, JSON-safe, and directly comparable against the UNIX
+     * seconds used by the vega series (x1000).
+     *
+     * `timestampSource` says which clock it came from, because an exchange
+     * timestamp and the server's own clock are not interchangeable when you are
+     * diagnosing a stale feed.
+     */
+    timestamp: toEpochMs(tick.exchange_timestamp)
+      ?? toEpochMs(tick.last_trade_time)
+      ?? Date.now(),
+    timestampSource: tick.exchange_timestamp ? 'exchange'
+      : tick.last_trade_time ? 'lastTrade'
+      : 'server',
   };
+}
+
+/** Any of Date | number | ISO string -> epoch ms, or null when unusable. */
+function toEpochMs(value) {
+  if (value == null) return null;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+  if (typeof value === 'number') {
+    // Kite's binary feed carries seconds; anything below ~1e11 is seconds.
+    return Number.isFinite(value) ? (value < 1e11 ? value * 1000 : value) : null;
+  }
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
 }
 
 module.exports = { normalizeTick };

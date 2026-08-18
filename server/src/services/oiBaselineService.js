@@ -1,6 +1,19 @@
 const db = require('../config/db');
 
 /**
+ * The IST trading date (B-11).
+ *
+ * These two writers used new Date().toISOString().slice(0,10) — the UTC date —
+ * while snapshot_date everywhere else in the system is the IST trading day. It
+ * happened to agree only because the capture crons fire at 15:35/15:40 IST
+ * (10:05/10:10 UTC, the same calendar date). Any change to those schedules, or
+ * a manual run in the evening, would have filed the rows under the wrong day.
+ */
+function todayIst() {
+  return new Date(Date.now() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+/**
  * Backs the two columns that CANNOT be derived from a live tick:
  *
  *   OI Change      = today's OI minus yesterday's CLOSING OI.
@@ -48,7 +61,7 @@ async function captureBaseline(latestTicks) {
     return 0;
   }
 
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayIst();
   const conn = await db.getConnection();
   try {
     await conn.beginTransaction();
@@ -77,7 +90,7 @@ async function captureBaseline(latestTicks) {
 /** Appends today's ATM IV so IV percentile has something to sit against. */
 async function recordAtmIv(symbol, atmIv) {
   if (atmIv == null) return;
-  const today = new Date().toISOString().slice(0, 10);
+  const today = todayIst();
   await db.query(
     `INSERT INTO iv_history (snapshot_date, symbol, atm_iv)
      VALUES (:date, :symbol, :iv)

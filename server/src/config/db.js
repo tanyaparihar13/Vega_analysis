@@ -16,6 +16,19 @@ const pool = mysql.createPool({
   connectionLimit: 15,
   queueLimit: 0,
   namedPlaceholders: true,
+  /**
+   * LOAD-BEARING — do not turn this off (see B-07).
+   *
+   * With dateStrings, DATE and DATETIME columns come back as 'YYYY-MM-DD' and
+   * 'YYYY-MM-DD HH:MM:SS' strings. Every date path in this application is
+   * written against that: expiryKey(), rowToPoint() (which appends 'Z' to read
+   * the value as the UTC it was written in), toIsoDate() and yearsToExpiry().
+   *
+   * Switching it to false hands those functions JS Date objects instead. That
+   * is now caught loudly rather than silently — yearsToExpiry throws on an
+   * unparseable value instead of returning NaN — but the correct configuration
+   * is still this one.
+   */
   dateStrings: true,
 });
 

@@ -68,7 +68,17 @@ function handleMessage(client, msg) {
 
 function handleSubscribe(client, { symbol, expiry }) {
   try {
-    const cfg = getUnderlying(symbol);
+    /**
+     * B-05: resolve F&O STOCKS as well as the curated five.
+     *
+     * This entry point used getUnderlying() alone — the five indices — while
+     * optionChainService.buildChain() beneath it has always handled every
+     * underlying in the instrument master. So the engine could serve a stock
+     * chain and this handler rejected it with `Unknown symbol` before the
+     * request ever got there. resolveUnderlying() checks the curated table
+     * first, so index behaviour is unchanged.
+     */
+    const cfg = instrumentService.resolveUnderlying(symbol) || getUnderlying(symbol);
     if (!cfg) throw Object.assign(new Error(`Unknown symbol: ${symbol}`), { statusCode: 404 });
 
     if (!instrumentService.isReady()) {
@@ -93,7 +103,13 @@ function handleSubscribe(client, { symbol, expiry }) {
 
     // websocketService filters broadcasts against this set, so a client
     // watching NIFTY never receives BANKNIFTY ticks.
-    client.subscribedTokens = new Set([...tokens, cfg.spotToken]);
+    //
+    // spotToken is filtered because a DERIVED underlying whose cash listing
+    // never matched has none — and a Set containing null would silently admit
+    // every tick whose instrumentToken is also null.
+    client.subscribedTokens = new Set(
+      [...tokens, cfg.spotToken].filter((t) => t != null)
+    );
 
     sendToClient(client, {
       type: 'chain_subscribed',
@@ -109,10 +125,65 @@ function handleSubscribe(client, { symbol, expiry }) {
   }
 }
 
+/**
+ * Immediate first paint on subscribe. Shares buildSnapshot() with the push loop
+ * so a freshly subscribed client and a client on the interval can never be
+ * looking at chains assembled by two different code paths.
+ */
 function pushChainTo(client) {
   const selection = subscriptionManager.getSelection(client);
   if (!selection || client.readyState !== 1 /* OPEN */) return;
 
+  const built = buildSnapshot(selection);
+  if (built instanceof Error) {
+    sendToClient(client, { type: 'chain_error', message: built.message });
+  } else {
+    sendToClient(client, { type: 'chain', data: built });
+  }
+}
+
+/**
+ * B-17: build each distinct chain ONCE per tick, then fan out.
+ *
+ * pushChainTo() called buildChain() per client, so ten browsers on NIFTY
+ * 28-Aug meant ten identical rebuilds a second — and a rebuild solves IV by
+ * Newton-Raphson for every strike on the board (~82 contracts at the default
+ * window). The payload was already identical for all of them; only the socket
+ * differed.
+ *
+ * The cache lives for the duration of one tick and is then dropped, so this
+ * changes nothing about freshness: every client still receives a snapshot built
+ * from the tick cache as it stood at that moment.
+ */
+function startPushLoop() {
+  if (pushTimer) clearInterval(pushTimer);
+  pushTimer = setInterval(() => {
+    const wss = getWss();
+    if (!wss) return;
+
+    const perTick = new Map(); // 'SYMBOL|expiry' -> snapshot | Error
+
+    wss.clients.forEach((client) => {
+      const selection = subscriptionManager.getSelection(client);
+      if (!selection || client.readyState !== 1 /* OPEN */) return;
+
+      const key = `${selection.symbol}|${selection.expiry}`;
+      if (!perTick.has(key)) perTick.set(key, buildSnapshot(selection));
+
+      const built = perTick.get(key);
+      if (built instanceof Error) {
+        sendToClient(client, { type: 'chain_error', message: built.message });
+      } else {
+        sendToClient(client, { type: 'chain', data: built });
+      }
+    });
+  }, PUSH_INTERVAL_MS);
+  if (pushTimer.unref) pushTimer.unref();
+}
+
+/** One chain snapshot for one {symbol, expiry}. Returns the Error rather than
+ *  throwing, so one bad selection cannot abort the whole push tick. */
+function buildSnapshot(selection) {
   try {
     const snapshot = optionChainService.buildChain({
       symbol: selection.symbol,
@@ -121,28 +192,14 @@ function pushChainTo(client) {
       oiBaseline: oiBaselineService.getBaselineMap(),
       strikeWindow: subscriptionManager.STRIKE_WINDOW,
     });
-
     snapshot.ivPercentile = optionChainService.calculateIvPercentile(
       snapshot.atmIv,
       oiBaselineService.getIvHistorySync(snapshot.symbol)
     );
-
-    sendToClient(client, { type: 'chain', data: snapshot });
+    return snapshot;
   } catch (err) {
-    sendToClient(client, { type: 'chain_error', message: err.message });
+    return err;
   }
-}
-
-function startPushLoop() {
-  if (pushTimer) clearInterval(pushTimer);
-  pushTimer = setInterval(() => {
-    const wss = getWss();
-    if (!wss) return;
-    wss.clients.forEach((client) => {
-      if (subscriptionManager.getSelection(client)) pushChainTo(client);
-    });
-  }, PUSH_INTERVAL_MS);
-  if (pushTimer.unref) pushTimer.unref();
 }
 
 function stop() {

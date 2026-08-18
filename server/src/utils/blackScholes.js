@@ -44,9 +44,46 @@ const MS_PER_YEAR = 365 * 24 * 60 * 60 * 1000;
  *
  * Treating expiry as a whole day makes theta and gamma badly wrong on expiry
  * day itself — which is exactly when traders care most about them.
+ *
+ * ---------------------------------------------------------------------------
+ * INPUT TYPES (B-07).
+ *
+ * This used to be `String(expiryDate).slice(0, 10)` unconditionally. For a JS
+ * Date that yields "Mon Aug 25", which parses to Invalid Date and returns NaN —
+ * and NaN fails every `T > 0` guard downstream, so IV comes back null, every
+ * Greek comes back null, isUsableOpenChain() refuses to freeze the day-open
+ * baseline, and the instrument records NOTHING for the entire session. The only
+ * thing that kept it latent is `dateStrings: true` in config/db.js, which makes
+ * MySQL hand back DATE columns as strings. That is one config line away from a
+ * silent, total data loss for an instrument.
+ *
+ * A Date is now normalised through the same IST shift the rest of the system
+ * uses, and anything genuinely unparseable THROWS rather than silently
+ * producing zeros. Throwing is correct here: buildChainFor() already wraps
+ * buildChain() in try/catch, so the sampler logs and skips that target instead
+ * of recording a chain full of fabricated zero Greeks.
+ * ---------------------------------------------------------------------------
  */
+function toExpiryDayKey(value) {
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return null;
+    // Shift into IST, then read the calendar date — matches
+    // instrumentService.toExpiryKey() and vegaTimeseriesService.expiryKey().
+    return new Date(value.getTime() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  }
+  const s = String(value ?? '').trim();
+  return s ? s.slice(0, 10) : null;
+}
+
 function yearsToExpiry(expiryDate, now = new Date()) {
-  const expiry = new Date(`${String(expiryDate).slice(0, 10)}T00:00:00Z`);
+  const key = toExpiryDayKey(expiryDate);
+  const expiry = key ? new Date(`${key}T00:00:00Z`) : new Date(NaN);
+  if (Number.isNaN(expiry.getTime())) {
+    throw new TypeError(
+      `yearsToExpiry: unparseable expiry ${JSON.stringify(expiryDate)} — ` +
+      'expected a Date or a YYYY-MM-DD / DATETIME / ISO string'
+    );
+  }
   expiry.setUTCHours(10, 0, 0, 0); // 15:30 IST
   return Math.max(expiry.getTime() - now.getTime(), 0) / MS_PER_YEAR;
 }
@@ -201,6 +238,38 @@ function forwardFromSpot(S, T, r = 0.065) {
   return S * Math.exp(r * T);
 }
 
+/**
+ * Re-date a traded futures price onto a DIFFERENT maturity (B-02).
+ *
+ * A forward is maturity-specific: F(T) = S·e^(rT). Using the front-month
+ * future's price as the forward for a weekly option prices that option against
+ * a forward maturing up to three weeks later. At NIFTY 24,000 and r = 6.5% that
+ * is ~90 index points, which biases delta by ~0.07 — and delta is exactly what
+ * decides which strikes enter the Call/Put Vega sums (the [start, deltaMax]
+ * band in vegaMath). So the error does not merely move the decimals; it changes
+ * WHICH contracts the totals are built from.
+ *
+ * Carrying the traded future back is better than rebuilding from spot because
+ * it keeps the market's own view of carry (dividends, funding, basis) and only
+ * removes the extra time:
+ *
+ *     F(T_opt) = F(T_fut) · e^(−r·(T_fut − T_opt))
+ *
+ * @param {number} futurePrice  traded price of the future
+ * @param {number} tFuture      years to the FUTURE's expiry
+ * @param {number} tOption      years to the OPTION's expiry
+ * @param {number} r            risk-free rate
+ * @returns {number|null}
+ */
+function discountForwardToExpiry(futurePrice, tFuture, tOption, r = 0.065) {
+  if (!(futurePrice > 0)) return null;
+  if (!Number.isFinite(tFuture) || !Number.isFinite(tOption)) return null;
+  // A future expiring before the option cannot be carried forward sensibly —
+  // that would be extrapolation, not discounting. Caller falls back to carry.
+  if (tFuture < tOption) return null;
+  return futurePrice * Math.exp(-r * (tFuture - tOption));
+}
+
 function round(value, dp) {
   if (!Number.isFinite(value)) return null;
   const f = 10 ** dp;
@@ -212,6 +281,8 @@ module.exports = {
   theoreticalPrice,
   rawVega,
   yearsToExpiry,
+  toExpiryDayKey,
+  discountForwardToExpiry,
   normCDF,
   normPDF,
   isCallType,

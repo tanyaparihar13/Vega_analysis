@@ -18,7 +18,10 @@ function listSymbols(req, res) {
 // GET /api/options/:symbol  — metadata + expiries + current spot
 function getSymbolMeta(req, res) {
   try {
-    const cfg = getUnderlying(req.params.symbol);
+    // B-05: resolve F&O stocks too. instrumentService checks the curated five
+    // first, so index behaviour is bit-for-bit what it was.
+    const cfg = instrumentService.resolveUnderlying(req.params.symbol)
+      || getUnderlying(req.params.symbol);
     if (!cfg) return res.status(404).json({ message: `Unknown symbol: ${req.params.symbol}` });
 
     const expiries = instrumentService.getExpiries(cfg.key);

@@ -20,41 +20,53 @@ const fmtInt = (v) =>
  * ---------------------------------------------------------------------------
  * DELTA BAND FILTER  (display only — snapshot.chain is never touched)
  * ---------------------------------------------------------------------------
- * Exact-match keys, deliberately NOT symbol.includes('NIFTY').
+ * THE BAND COMES FROM THE SERVER (B-06). It is not defined here.
  *
- *   "BANKNIFTY".includes("NIFTY")   === true
- *   "FINNIFTY".includes("NIFTY")    === true
- *   "MIDCPNIFTY".includes("NIFTY")  === true
+ * This file used to carry its own DELTA_BANDS table, and it had drifted from
+ * the server's:
  *
- * so a contains-check would hand all three the 0.05 band and the 0.20 rule
- * would never run.
+ *   · stock floor       client 0.05   server 0.20  (vegaConfig.STOCK_START)
+ *   · ceiling           client 0.60 hardcoded      server env-tunable
+ *                                                  (VEGA_DELTA_MAX)
+ *   · epsilon           client 1e-6 slack          server none
  *
- * Call and Put deltas are tested against their OWN signed range. Call delta
- * is positive (0 to 1), put delta is negative (-1 to 0), straight from the
- * feed — no Math.abs anywhere.
+ * So the table showed a different basket of strikes from the one the Vega chart
+ * was actually summing for the same instrument — and changing VEGA_DELTA_MAX
+ * silently desynchronised them further. The history of this file makes the case
+ * on its own: it previously shipped with min and max SWAPPED for NIFTY and
+ * SENSEX, so `d >= 0.60 && d <= 0.05` was unsatisfiable and the call side was
+ * dead for both symbols. Two implementations of one financial rule is one too
+ * many.
  *
- * ---------------------------------------------------------------------------
- * FIXED HERE: NIFTY and SENSEX had min and max SWAPPED on the call side:
+ * `snapshot.deltaBand` is emitted by optionChainService.buildChain() from
+ * vegaConfig.deltaStartFor() — the same function vegaMath's sums are filtered
+ * with. The test below is byte-for-byte the server's vegaMath.passes():
  *
- *     NIFTY:  { call: { max: 0.05, min: 0.60 }, ... }
+ *     abs(delta) >= start && abs(delta) <= max
  *
- * inRange() evaluates `d >= min && d <= max`, so that read as
- * `d >= 0.60 && d <= 0.05` — impossible for any number. The call side was
- * dead for both symbols and only the put side could ever keep a row.
- * BANKNIFTY / FINNIFTY / MIDCPNIFTY were already correct.
+ * inclusive at both ends, no epsilon, absolute value on both sides. Call delta
+ * is positive and put delta negative straight from the feed, so taking the
+ * absolute value is what applies one band symmetrically to both — exactly as
+ * the engine does.
  * ---------------------------------------------------------------------------
  */
-const DELTA_BANDS = {
-  NIFTY: { call: { min: 0.05, max: 0.60 }, put: { min: -0.60, max: -0.05 } },
-  SENSEX: { call: { min: 0.05, max: 0.60 }, put: { min: -0.60, max: -0.05 } },
-  BANKNIFTY: { call: { min: 0.20, max: 0.60 }, put: { min: -0.60, max: -0.20 } },
-  FINNIFTY: { call: { min: 0.20, max: 0.60 }, put: { min: -0.60, max: -0.20 } },
-  MIDCPNIFTY: { call: { min: 0.20, max: 0.60 }, put: { min: -0.60, max: -0.20 } },
-};
 
-// Equity F&O underlyings (RELIANCE, SBIN, TCS...) are not in the spec.
-// They fall back to the wider (NIFTY/SENSEX) band rather than showing nothing.
-const DEFAULT_BAND = { call: { min: 0.05, max: 0.60 }, put: { min: -0.60, max: -0.05 } };
+/** Mirrors vegaConfig defaults; used only if a payload predates `deltaBand`. */
+const FALLBACK_BAND = { start: 0.05, max: 0.60 };
+
+function getDeltaBand(snapshot) {
+  const b = snapshot?.deltaBand;
+  return (b && Number.isFinite(Number(b.start)) && Number.isFinite(Number(b.max)))
+    ? { start: Number(b.start), max: Number(b.max) }
+    : FALLBACK_BAND;
+}
+
+/** server/src/utils/vegaMath.js :: passes() — same rule, same inclusivity. */
+function passes(delta, band) {
+  if (delta == null) return false;
+  const d = Math.abs(Number(delta));
+  return Number.isFinite(d) && d >= band.start && d <= band.max;
+}
 
 /**
  * Which side decides whether a strike is shown.
@@ -64,16 +76,10 @@ const DEFAULT_BAND = { call: { min: 0.05, max: 0.60 }, put: { min: -0.60, max: -
  *   'OR'   either side
  *   'AND'  both sides
  *
- * 'CALL' is the default because it reproduces the reference screenshot. On
- * that board (call delta 0.90 down to 0.04) the three modes give:
- *
- *     CALL  12 rows   call delta 0.05 – 0.54
- *     OR    18 rows   call delta 0.05 – 0.90
- *     AND    3 rows   call delta 0.40 – 0.54
- *
- * 'OR' looks wrong on a chain because Δcall − Δput = 1 at every strike: the
- * 0.90-delta call sits opposite a −0.10 put, which IS inside −0.60..−0.05,
- * so 'OR' keeps the deep-ITM rows the band was meant to hide.
+ * 'CALL' is the default because it reproduces the reference screenshot. 'OR'
+ * looks wrong on a chain because |Δcall| + |Δput| = 1 at every strike: the
+ * 0.90-delta call sits opposite a −0.10 put, which IS inside the band, so 'OR'
+ * keeps the deep-ITM rows the band exists to hide.
  *
  * Whichever mode is set, rows are kept or dropped WHOLE — a surviving row
  * always carries the call and the put of the SAME strike, and order is never
@@ -81,30 +87,9 @@ const DEFAULT_BAND = { call: { min: 0.05, max: 0.60 }, put: { min: -0.60, max: -
  */
 const MATCH_MODE = 'CALL';
 
-function getDeltaBand(symbol) {
-  return DELTA_BANDS[String(symbol || '').toUpperCase()] || DEFAULT_BAND;
-}
-
-/**
- * Straight signed range check, inclusive at both ends — "0.60 se chhoti,
- * 0.05 se badi, aur unke barabar" means 0.05 and 0.60 themselves are IN.
- *
- * EPSILON: delta arrives as a solved float (derived from IV), so a strike
- * that is conceptually exactly 0.05 or 0.60 can turn up as 0.049999998 or
- * 0.600000004. A strict >= / <= would drop that boundary strike even though
- * it belongs. 1e-6 is far tighter than delta ever moves tick to tick, so it
- * only rescues true boundary cases and never widens the band in practice.
- */
-const EPS = 1e-6;
-function inRange(delta, range) {
-  if (delta == null) return false;
-  const d = Number(delta);
-  return Number.isFinite(d) && d >= range.min - EPS && d <= range.max + EPS;
-}
-
 function rowPassesFilter(row, band) {
-  const callOk = inRange(row?.call?.delta, band.call);
-  const putOk = inRange(row?.put?.delta, band.put);
+  const callOk = passes(row?.call?.delta, band);
+  const putOk = passes(row?.put?.delta, band);
   switch (MATCH_MODE) {
     case 'PUT': return putOk;
     case 'OR': return callOk || putOk;
@@ -200,7 +185,7 @@ export default function OptionChainTable({ snapshot, onSelectStrike }) {
    */
   const filteredRows = useMemo(() => {
     if (!snapshot?.chain?.length) return [];
-    const band = getDeltaBand(snapshot.symbol);
+    const band = getDeltaBand(snapshot);
     return snapshot.chain.filter((row) => rowPassesFilter(row, band));
   }, [snapshot]);
 
@@ -243,7 +228,7 @@ export default function OptionChainTable({ snapshot, onSelectStrike }) {
   // out fractionally wider and the strike drifts off centre.
   const sideWidth = `${(96 / (callSpan + putSpan)).toFixed(3)}%`;
 
-  const band = getDeltaBand(snapshot.symbol);
+  const band = getDeltaBand(snapshot);
   const CALL_TOTALS = { Delta: totals.callDelta, Vega: totals.callVega };
   const PUT_TOTALS = { Vega: totals.putVega, Delta: totals.putDelta };
   const totalDp = (label) => (label === 'Delta' ? 3 : 2);
@@ -298,8 +283,8 @@ export default function OptionChainTable({ snapshot, onSelectStrike }) {
                 colSpan={callSpan + 1 + putSpan}
                 className="px-3 py-8 text-center text-xs text-gray-500"
               >
-                No strikes with a call delta between {band.call.min.toFixed(2)} and{' '}
-                {band.call.max.toFixed(2)} yet. Greeks appear once the feed solves IV
+                No strikes with a call delta between {band.start.toFixed(2)} and{' '}
+                {band.max.toFixed(2)} yet. Greeks appear once the feed solves IV
                 for these contracts.
               </td>
             </tr>
