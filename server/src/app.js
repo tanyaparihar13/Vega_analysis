@@ -34,7 +34,25 @@ const app = express();
 app.set('trust proxy', 1);
 
 app.use(helmet());
-app.use(cors({ origin: process.env.CLIENT_URL || 'http://localhost:5173', credentials: true }));
+/**
+ * CORS allowlist.
+ *
+ * CLIENT_URL stays SINGLE-valued on purpose: it also builds the password-reset
+ * link (authController.resetLinkBase) and the post-OAuth redirect back to the
+ * SPA (zerodhaController), so a comma-separated value would corrupt both.
+ * Additional browser origins that must reach this API — www., a staging host —
+ * go in CORS_EXTRA_ORIGINS instead. With that unset the behaviour is identical
+ * to the previous single-origin form.
+ */
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
+const CORS_ORIGINS = [
+  CLIENT_URL,
+  ...String(process.env.CORS_EXTRA_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+];
+app.use(cors({ origin: CORS_ORIGINS, credentials: true }));
 app.use(express.json());
 
 /**
