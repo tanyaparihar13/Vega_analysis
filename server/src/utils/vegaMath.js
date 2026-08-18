@@ -78,11 +78,36 @@ function strikeKey(v) {
   return Number(v);
 }
 
-/** PHP: abs(delta) >= start && abs(delta) <= deltaMax */
-function passes(delta, start, deltaMax) {
+/**
+ * SIGNED delta band test.
+ *
+ *     CALL:        start <= delta <=  deltaMax
+ *     PUT :   -deltaMax <= delta <= -start
+ *
+ * Inclusive at both ends on both sides.
+ *
+ * WHY NOT abs(delta). For correctly-signed input the two rules are identical,
+ * because put delta is negative by construction (blackScholes: N(d1) - 1, and
+ * Black-76: -e^(-rT) N(-d1)). They diverge in exactly one situation: when the
+ * SIGN IS WRONG — a put delta that arrives positive, or a call delta that
+ * arrives negative, from a bad upstream payload, a JSON round-trip that stored
+ * a magnitude, or a future refactor that normalises deltas. abs() accepts all
+ * of those into the sum; the signed test rejects them, which is what "put delta
+ * between -0.60 and -0.05" is supposed to mean.
+ *
+ * `side` is optional ONLY so the existing three-argument callers (and the
+ * published test surface) keep working. When it is omitted the side is inferred
+ * from the sign, which reproduces the old abs() behaviour bit for bit. Every
+ * real call site in this file passes it explicitly.
+ */
+function passes(delta, start, deltaMax, side) {
   if (delta == null) return false;
-  const d = Math.abs(Number(delta));
-  return Number.isFinite(d) && d >= start && d <= deltaMax;
+  const d = Number(delta);
+  if (!Number.isFinite(d)) return false;
+  if (side === 'call') return d >= start && d <= deltaMax;
+  if (side === 'put') return d >= -deltaMax && d <= -start;
+  // No side stated: infer from the sign (identical to the previous abs() rule).
+  return d >= 0 ? (d >= start && d <= deltaMax) : (d >= -deltaMax && d <= -start);
 }
 
 /**
@@ -96,8 +121,11 @@ function pickStrikes(chain, start, deltaMax) {
   const putStrikes = [];
   for (const row of chain) {
     const strike = strikeKey(row.strike);
-    if (passes(row.call?.delta, start, deltaMax)) callStrikes.push(strike);
-    if (passes(row.put?.delta, start, deltaMax)) putStrikes.push(strike);
+    // Side stated explicitly: a call is tested against [start, deltaMax] and a
+    // put against [-deltaMax, -start]. A wrong-signed delta is now rejected
+    // rather than being folded in by abs().
+    if (passes(row.call?.delta, start, deltaMax, 'call')) callStrikes.push(strike);
+    if (passes(row.put?.delta, start, deltaMax, 'put')) putStrikes.push(strike);
   }
   return { callStrikes, putStrikes };
 }
@@ -159,8 +187,9 @@ function retainStable(currentChain, openStrikes, side, start, deltaMax, hysteres
     // Keep it — the vega guard in computePoint will skip it for this sample if
     // its vega is unusable too, which is the correct, narrower response.
     if (d == null || !Number.isFinite(Number(d))) { out.push(k); continue; }
-    const abs = Math.abs(Number(d));
-    if (abs >= lo && abs <= hi) out.push(k);
+    // Signed retention test, matching passes(): the widened band is
+    // [lo, hi] for a call and [-hi, -lo] for a put.
+    if (passes(d, lo, hi, side)) out.push(k);
   }
   return out;
 }

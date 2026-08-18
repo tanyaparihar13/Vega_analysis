@@ -61,11 +61,24 @@ function getDeltaBand(snapshot) {
     : FALLBACK_BAND;
 }
 
-/** server/src/utils/vegaMath.js :: passes() — same rule, same inclusivity. */
-function passes(delta, band) {
+/**
+ * server/src/utils/vegaMath.js :: passes() — same rule, same inclusivity.
+ *
+ *     CALL:      start <= delta <=  max
+ *     PUT :      -max  <= delta <= -start
+ *
+ * Signed, not abs(): identical for correctly-signed input, but a put delta that
+ * arrives positive (or a call delta that arrives negative) is rejected here the
+ * same way the server rejects it, so the table and the Vega sums cannot drift
+ * apart on bad data.
+ */
+function passes(delta, band, side) {
   if (delta == null) return false;
-  const d = Math.abs(Number(delta));
-  return Number.isFinite(d) && d >= band.start && d <= band.max;
+  const d = Number(delta);
+  if (!Number.isFinite(d)) return false;
+  if (side === 'call') return d >= band.start && d <= band.max;
+  if (side === 'put') return d >= -band.max && d <= -band.start;
+  return d >= 0 ? (d >= band.start && d <= band.max) : (d >= -band.max && d <= -band.start);
 }
 
 /**
@@ -88,8 +101,8 @@ function passes(delta, band) {
 const MATCH_MODE = 'CALL';
 
 function rowPassesFilter(row, band) {
-  const callOk = passes(row?.call?.delta, band);
-  const putOk = passes(row?.put?.delta, band);
+  const callOk = passes(row?.call?.delta, band, 'call');
+  const putOk = passes(row?.put?.delta, band, 'put');
   switch (MATCH_MODE) {
     case 'PUT': return putOk;
     case 'OR': return callOk || putOk;

@@ -52,6 +52,32 @@ function envSymbolList(name) {
 }
 
 /**
+ * PER-STOCK delta floor overrides, e.g. "RELIANCE:0.25,TATASTEEL:0.30".
+ *
+ * A single floor for every F&O stock is the wrong shape for stocks, and only
+ * happened to be adequate because STOCK_START was tuned for a liquid mid-cap.
+ * A stock's usable band is a property of ITS OWN board — strike step relative
+ * to a typical weekly move, how many strikes actually trade, and how far out
+ * IV stays solvable. TATASTEEL at ~160 with a 5-point grid and RELIANCE at
+ * ~1400 with a 20-point grid do not have comparable delta coverage, so pinning
+ * both to 0.20 either drags in unsolvable far-OTM strikes on one or starves
+ * the sum on the other.
+ *
+ * Unset keys fall through to STOCK_START, so the default behaviour is exactly
+ * what it was — this only adds a place to say otherwise, per symbol, without
+ * touching code.
+ */
+function envSymbolNumberMap(name) {
+  const out = {};
+  for (const pair of String(process.env[name] || '').split(',')) {
+    const [sym, val] = pair.split(':').map((s) => (s || '').trim());
+    const n = Number(val);
+    if (sym && Number.isFinite(n)) out[sym.toUpperCase()] = n;
+  }
+  return out;
+}
+
+/**
  * Trend pill colours. These are sent to the client and rendered as-is, so they
  * must be legible on the app's LIGHT surfaces.
  *
@@ -86,8 +112,14 @@ const TREND = {
  */
 function deltaStartFor(symbol) {
   const key = String(symbol || '').toUpperCase();
+  // 1. Curated index floors (NIFTY/SENSEX 0.05; BANKNIFTY/FINNIFTY/MIDCPNIFTY 0.20).
   if (DELTA_START[key] != null) return DELTA_START[key];
-  return instruments.getUnderlying(key) ? 0.05 : module.exports.STOCK_START;
+  // 2. Per-stock override, if one was configured for THIS symbol.
+  const perStock = module.exports.STOCK_DELTA_START_OVERRIDES[key];
+  if (perStock != null) return perStock;
+  // 3. Otherwise: any other curated index defaults to the index floor, and
+  //    everything else is an F&O stock and gets the stock floor.
+  return instruments.getUnderlying(key) ? module.exports.DEFAULT_START : module.exports.STOCK_START;
 }
 
 module.exports = {
@@ -109,6 +141,13 @@ module.exports = {
    * path where one side uses a different band from the other.
    */
   STOCK_START: envNum('VEGA_STOCK_DELTA_START', 0.20),
+
+  /**
+   * Per-symbol floors that win over STOCK_START. See envSymbolNumberMap().
+   * Format: VEGA_STOCK_DELTA_START_OVERRIDES="RELIANCE:0.25,TATASTEEL:0.30"
+   * Empty by default, so nothing changes until a symbol is named.
+   */
+  STOCK_DELTA_START_OVERRIDES: envSymbolNumberMap('VEGA_STOCK_DELTA_START_OVERRIDES'),
 
   DELTA_MAX: envNum('VEGA_DELTA_MAX', 0.6),  // PHP: hard-coded 0.6 ceiling in addvega.php
 
