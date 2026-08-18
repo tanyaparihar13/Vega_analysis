@@ -39,7 +39,9 @@ const pool = mysql.createPool({
     console.log("[DB] MySQL pool connected successfully");
     connection.release();
   } catch (err) {
-    console.error("[DB] Failed to connect to MySQL:", err.message);
+    // mysql2 connection errors carry the reason in `code` and often leave
+    // `message` empty — printing message alone gave a bare "Failed to connect".
+    console.error("[DB] Failed to connect to MySQL:", err.code || err.message);
   }
 })();
 

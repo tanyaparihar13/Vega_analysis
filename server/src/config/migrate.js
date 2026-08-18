@@ -60,7 +60,7 @@ async function run({ verbose = true } = {}) {
   try {
     conn = await createMigrationConnection();
   } catch (err) {
-    console.error('[Migrate] Cannot reach MySQL:', err.message);
+    console.error('[Migrate] Cannot reach MySQL:', err.code || err.message);
     console.error('[Migrate] Check DB_HOST / DB_PORT / DB_USER / DB_PASSWORD in server/.env');
     throw err;
   }

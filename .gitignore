@@ -9,3 +9,7 @@ npm-debug.log*
 .DS_Store
 .vscode/
 .idea/
+
+# Timestamped/manual copies of .env — same secrets, different name.
+.env.backup*
+.env.bak

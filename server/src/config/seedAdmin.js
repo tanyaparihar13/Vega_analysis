@@ -110,7 +110,7 @@ async function run({ verbose = true } = {}) {
     return { action: 'created', email };
   } catch (err) {
     // Never fatal. A DB hiccup at boot should not stop the API from serving.
-    console.error('[SeedAdmin] Failed:', err.message);
+    console.error('[SeedAdmin] Failed:', err.code || err.message);
     return null;
   }
 }

@@ -86,7 +86,10 @@ async function step(name, fn) {
   try {
     return await fn();
   } catch (err) {
-    console.error(`[Boot] ${name} failed — continuing degraded:`, err.message);
+    // `err.code` first: a mysql2 connection failure arrives with an EMPTY
+    // message and the reason only in `code` (ECONNREFUSED, ER_ACCESS_DENIED_ERROR),
+    // which used to print "failed — continuing degraded:" and nothing else.
+    console.error(`[Boot] ${name} failed — continuing degraded:`, err.code || err.message);
     return null;
   }
 }
@@ -174,7 +177,19 @@ let listening = false;
    * subsystem fault turned into a 502.
    */
   if (!listening) {
-    console.error('[Boot] Could not bind the port — exiting:', err.message);
+    if (err.code === 'EADDRINUSE') {
+      /**
+       * Almost always a SECOND backend instance, not a stray unrelated program:
+       * `npm start` left running in one terminal while `npm run dev` is started
+       * in another. Run ONE of them, never both.
+       */
+      console.error(`[Boot] Port ${PORT} is already in use — another backend instance is running.`);
+      console.error('[Boot] Find it and stop it, then start again:');
+      console.error(`[Boot]   netstat -ano | findstr :${PORT}`);
+      console.error('[Boot]   taskkill /PID <pid> /F');
+    } else {
+      console.error('[Boot] Could not bind the port — exiting:', err.code || err.message);
+    }
     process.exit(1);
   }
   console.error('[Boot] Startup error after listen — continuing degraded:', err);
