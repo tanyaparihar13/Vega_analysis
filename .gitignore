@@ -13,3 +13,16 @@ npm-debug.log*
 # Timestamped/manual copies of .env — same secrets, different name.
 .env.backup*
 .env.bak
+
+# Any .env VARIANT, not just the bare name. Production has accumulated
+# server/.env.save and client/.env.production; .env.save alone carries the DB
+# password, JWT secret, Kite API secret and the token encryption key. The
+# narrower rules above (.env.local/.env.backup*/.env.bak) missed both, so a
+# single `git add -A` on the server would have published them.
+.env.*
+!.env.example
+!.env.sample
+
+# Hand-made copies of source files left behind while debugging on the box.
+*.bak
+*.backup
