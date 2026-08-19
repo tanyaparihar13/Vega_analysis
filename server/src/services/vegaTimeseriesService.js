@@ -319,19 +319,42 @@ function demandStats() {
  */
 function isUsableOpenChain(chain, minFraction = 0.5) {
   if (!chain.length) return false;
-  let withGreeks = 0;
+  /**
+   * EACH SIDE IS CHECKED ON ITS OWN (baseline fix).
+   *
+   * This used to count a row as usable when EITHER side had a vega:
+   *
+   *     if (row.call?.vega || row.put?.vega) withGreeks += 1;
+   *
+   * At 09:15:00 on 2026-08-19 the NIFTY 25-Aug board had 60 of 61 calls priced
+   * but only 39 of 61 puts - the puts had not traded yet. The OR scored that
+   * ~98% and accepted it, so the PUT baseline was summed over a minority of
+   * contracts. Every later point is `current - open`, so the entire session's
+   * put series carried a constant offset of roughly +5 vega while the call side
+   * looked fine. Shape matched the reference platforms; level did not.
+   *
+   * Requiring each side to clear the threshold separately makes the capture
+   * fail and retry on the next tick until both sides are genuinely trading.
+   * See tests/fixtures/openChain-2026-08-19-NIFTY-0915.json for that board.
+   */
+  let calls = 0;
+  let puts = 0;
   for (const row of chain) {
-    if (row.call?.vega || row.put?.vega) withGreeks += 1;
+    if (row.call?.vega) calls += 1;
+    if (row.put?.vega) puts += 1;
   }
-  return withGreeks / chain.length >= minFraction;
+  return (calls / chain.length) >= minFraction
+      && (puts / chain.length) >= minFraction;
 }
 
 /** Trim a built chain to the per-strike greeks the calculation/baseline need. */
 function toGreekChain(chain) {
   return chain.map((r) => ({
     strike: r.strike,
-    call: { vega: g(r.call?.vega), theta: g(r.call?.theta), gamma: g(r.call?.gamma), delta: g(r.call?.delta), iv: g(r.call?.iv) },
-    put: { vega: g(r.put?.vega), theta: g(r.put?.theta), gamma: g(r.put?.gamma), delta: g(r.put?.delta), iv: g(r.put?.iv) },
+    // ltp rides along so chainSnapshotStore can archive the traded price the IV
+    // was solved from. Nothing in vegaMath reads it; it is audit data.
+    call: { vega: g(r.call?.vega), theta: g(r.call?.theta), gamma: g(r.call?.gamma), delta: g(r.call?.delta), iv: g(r.call?.iv), ltp: g(r.call?.ltp) },
+    put: { vega: g(r.put?.vega), theta: g(r.put?.theta), gamma: g(r.put?.gamma), delta: g(r.put?.delta), iv: g(r.put?.iv), ltp: g(r.put?.ltp) },
   }));
 }
 const g = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
@@ -482,6 +505,17 @@ async function captureDayOpen(symbol, expiry) {
   const entry = state.get(key) || { symbol: c.key, expiry: chosen, open: null, series: [] };
   if (entry.open) return entry.open; // immutable for the session
 
+  /**
+   * NOT BEFORE 09:16 IST (addvega.php parity).
+   *
+   * AlphaEdge gates every run on `$t2 = ... ' 9:16'`, so its day-open record is
+   * taken a minute after the bell rather than on it. Ours took 09:15:00 - the
+   * first instant of the session, when much of the board still carries
+   * yesterday's close. Recording itself still begins at MARKET_OPEN_MIN; only
+   * the baseline waits. Returning null here just defers to the next tick.
+   */
+  if (istParts().minutes < cfg.BASELINE_MIN_IST) return null;
+
   const built = buildChainFor(c.key, chosen);
   if (!built) return null;
 
@@ -489,7 +523,7 @@ async function captureDayOpen(symbol, expiry) {
   const openChain = toGreekChain(built.snap.chain);
   if (!openChain.length) return null;
 
-  if (!isUsableOpenChain(openChain)) {
+  if (!isUsableOpenChain(openChain, cfg.BASELINE_MIN_SIDE_FRACTION)) {
     vlog(`Rejected day-open for ${c.key} ${chosen}: Greeks mostly null (stale ticks?) — retrying next tick`, true);
     return null;
   }
@@ -1521,7 +1555,7 @@ module.exports = {
   listExpiries, resolveExpiry, trackedExpiries, defaultLiveExpiry,
   registerDemand, releaseDemand, onTick,
   resolveSymbol, isIndex, persistResolutionFor, canServe, servableTimeframes,
-  storedResolutions, bucketByTimeframe, bucketStartFor,
+  storedResolutions, bucketByTimeframe, bucketStartFor, isUsableOpenChain,
   loadDelayed, PUBLIC_DELAY_MINUTES,
   // Exported so the WebSocket push uses the SAME sign convention and trend
   // derivation as every other reader — see decorate()'s header.

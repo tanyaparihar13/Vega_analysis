@@ -104,6 +104,7 @@ const SERIES_META = [
   { key: 'call', label: 'Call Vega', color: SERIES_COLORS.call },
   { key: 'put', label: 'Put Vega', color: SERIES_COLORS.put },
   { key: 'diff', label: 'Difference', color: SERIES_COLORS.diff },
+  { key: 'price', label: 'Future', color: SERIES_COLORS.price },
 ];
 
 // ---------------------------------------------------------------------------
@@ -609,7 +610,7 @@ export default function VegaAnalysis() {
   const [data, setData] = useState(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [visible, setVisible] = useState({ call: true, put: true, diff: true });
+  const [visible, setVisible] = useState({ call: true, put: true, diff: true, price: true });
   // Excel export state. `error` is reused for failures so there is one place a
   // user looks for "something went wrong on this page".
   const [exporting, setExporting] = useState(false);

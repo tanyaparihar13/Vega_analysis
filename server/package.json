@@ -10,7 +10,7 @@
     "db:migrate": "node src/config/migrate.js",
     "seed:admin": "node src/config/seedAdmin.js",
     "verify:live": "node verify-live.js",
-    "test": "node --test \"tests/*.test.js\"",
+    "test": "node --test --test-force-exit \"tests/*.test.js\"",
     "db:duplicates": "node scripts/check-duplicates.js"
   },
   "dependencies": {

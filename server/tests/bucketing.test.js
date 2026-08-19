@@ -121,8 +121,11 @@ test('the in-progress bucket updates as samples arrive (no frozen bar)', () => {
   assert.equal(firstBucket.length, 12, 'all 12 samples fall in the first 1m bucket');
 
   // The value carried must advance — this is what "not frozen" means.
-  assert.equal(firstBucket[0].point.callVegaDiff, -100, 'first sample (display-signed)');
-  assert.equal(firstBucket[11].point.callVegaDiff, -111, 'twelfth sample (display-signed)');
+  // DISPLAY_SIGN is configurable (VEGA_DISPLAY_SIGN); assert against the sign in
+  // force rather than the old hardcoded -1, so the suite is valid either way.
+  const S = require('../src/config/vegaConfig').DISPLAY_SIGN;
+  assert.equal(firstBucket[0].point.callVegaDiff, 100 * S, 'first sample (display-signed)');
+  assert.equal(firstBucket[11].point.callVegaDiff, 111 * S, 'twelfth sample (display-signed)');
   assert.equal(firstBucket[0].bucketAdvanced, true, 'first sample opens the bucket');
   assert.equal(firstBucket[11].bucketAdvanced, false, 'later samples revise it');
 });
@@ -136,7 +139,8 @@ test('the closed bucket holds the LAST sample, matching what is persisted', () =
   // Raw stored value of the closing sample of bucket 0 is index 11 -> 111.
   assert.equal(history[0].callVegaDiff, 111, 'history keeps the last sample of the bucket');
   // decorate() applies DISPLAY_SIGN, so the served value is the negation.
-  assert.equal(live[0].callVegaDiff, -111, 'live converges on the same sample');
+  assert.equal(live[0].callVegaDiff, 111 * require('../src/config/vegaConfig').DISPLAY_SIGN,
+    'live converges on the same sample');
   assert.equal(live[0].time, T0);
   assert.equal(live[1].time, T0 + 60);
 });

@@ -25,10 +25,12 @@ function trimChain(chain) {
     call: {
       vega: r.call?.vega ?? null, theta: r.call?.theta ?? null,
       gamma: r.call?.gamma ?? null, delta: r.call?.delta ?? null, iv: r.call?.iv ?? null,
+      ltp: r.call?.ltp ?? null,   // the traded price the IV was solved from
     },
     put: {
       vega: r.put?.vega ?? null, theta: r.put?.theta ?? null,
       gamma: r.put?.gamma ?? null, delta: r.put?.delta ?? null, iv: r.put?.iv ?? null,
+      ltp: r.put?.ltp ?? null,
     },
   }));
 }

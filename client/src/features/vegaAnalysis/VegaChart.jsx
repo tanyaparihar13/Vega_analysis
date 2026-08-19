@@ -26,6 +26,9 @@ export const SERIES_COLORS = {
   call: '#0f7a46',
   put: '#c62828',
   diff: '#5b5f97',   // purple-grey, per the reference platforms' Difference line
+  // Slate, deliberately quieter than the three vega series: the underlying
+  // is CONTEXT for the vega curves, not a fourth signal competing with them.
+  price: '#64748b',
 };
 
 /**
@@ -282,6 +285,15 @@ function VegaChart({
         // Wider gutter so 4-figure vega values are never clipped or ellipsised.
         minimumWidth: 72,
       },
+      leftPriceScale: {
+        borderColor: AXIS_LINE,
+        // Starts hidden and is switched on only when the payload actually
+        // carries a price (the public teaser strips it), so a chart without
+        // the underlying shows no empty second gutter.
+        visible: false,
+        scaleMargins: { top: 0.09, bottom: 0.09 },
+        entireTextOnly: true,
+      },
       timeScale: {
         borderColor: AXIS_LINE,
         timeVisible: true,
@@ -364,6 +376,25 @@ function VegaChart({
       diff: chart.addLineSeries({
         ...common, color: SERIES_COLORS.diff, lineWidth: 2,
         title: 'Difference',
+      }),
+      /**
+       * The underlying (future/spot) that the vega is measured against, on
+       * its OWN left scale — vega deviations live near zero while the index
+       * sits in the tens of thousands, so sharing one scale would flatten
+       * the vega curves into a horizontal line. Dotted and thin because it
+       * is reference context, not a signal to read values off.
+       */
+      price: chart.addLineSeries({
+        priceScaleId: 'left',
+        color: SERIES_COLORS.price,
+        lineWidth: 1,
+        lineStyle: LineStyle.Dotted,
+        title: 'Future',
+        lastValueVisible: true,
+        priceLineVisible: false,
+        crosshairMarkerVisible: true,
+        crosshairMarkerRadius: 3,
+        priceFormat: { type: 'price', precision: 2, minMove: 0.05 },
       }),
     };
 
@@ -486,6 +517,7 @@ function VegaChart({
 
     if (!points.length) {
       s.call.setData([]); s.put.setData([]); s.diff.setData([]);
+        s.price?.setData([]);
       prevRef.current = { len: 0, firstTime: null, lastTime: null };
       return;
     }
@@ -529,6 +561,9 @@ function VegaChart({
       if (p.callVegaDiff != null) s.call.update({ time: p.time, value: Number(p.callVegaDiff) });
       if (p.putVegaDiff != null) s.put.update({ time: p.time, value: Number(p.putVegaDiff) });
       if (p.vegaDiff != null) s.diff.update({ time: p.time, value: Number(p.vegaDiff) });
+        if (p.price != null && Number.isFinite(Number(p.price))) {
+          s.price?.update({ time: p.time, value: Number(p.price) });
+        }
     } else {
       // A date/symbol switch replaces the whole series. setData is synchronous,
       // so fitting the range in the same tick avoids the one-frame flash of the
@@ -536,6 +571,10 @@ function VegaChart({
       s.call.setData(toLine('callVegaDiff'));
       s.put.setData(toLine('putVegaDiff'));
       s.diff.setData(toLine('vegaDiff'));
+      const priceLine = toLine('price');
+      s.price?.setData(priceLine);
+      // Only claim gutter width when there is actually an underlying to draw.
+      chartRef.current?.priceScale('left').applyOptions({ visible: priceLine.length > 0 });
       chartRef.current?.timeScale().fitContent();
     }
 
@@ -549,7 +588,9 @@ function VegaChart({
     s.call.applyOptions({ visible: visible.call !== false });
     s.put.applyOptions({ visible: visible.put !== false });
     s.diff.applyOptions({ visible: visible.diff !== false });
-  }, [visible.call, visible.put, visible.diff]);
+
+    s.price?.applyOptions({ visible: visible.price !== false });
+  }, [visible.call, visible.put, visible.diff, visible.price]);
 
   const resetZoom = useCallback(() => chartRef.current?.timeScale().fitContent(), []);
 

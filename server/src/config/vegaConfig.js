@@ -258,6 +258,41 @@ module.exports = {
   TOKEN_BUDGET: Math.max(200, Math.min(Number(process.env.VEGA_TOKEN_BUDGET) || 2800, 3000)),
 
   MARKET_OPEN_MIN: 555,     // 09:15 IST, in minutes-from-midnight
+
+  /**
+   * Earliest minute at which the day-open BASELINE may be captured (09:16 IST).
+   * Recording still starts at MARKET_OPEN_MIN; only the baseline waits, so it is
+   * never built from pre-trade prices. Mirrors AlphaEdge's `$t2` 9:16 guard.
+   */
+  BASELINE_MIN_IST: envNum('VEGA_BASELINE_MIN_IST', 556),
+
+  /**
+   * Minimum fraction of the board that must be priced ON EACH SIDE before the
+   * day-open baseline is accepted.
+   *
+   * WHY 0.5 AND NOT HIGHER. 0.75 was the intuitive candidate after the
+   * 2026-08-19 baseline bug, so it was measured against every archived
+   * day-open chain (164 boards over four sessions) before being adopted:
+   *
+   *     threshold   13 Aug   14 Aug   17 Aug   19 Aug   (targets rejected /41)
+   *       0.50        1        2        0        1
+   *       0.60        1        3        3        5
+   *       0.75        3       13        7       20
+   *       0.80       10       18       13       23
+   *
+   * At 0.75 nearly half of one session's universe is refused. The refusals are
+   * not stale data — they are genuinely illiquid single-stock boards whose puts
+   * simply do not all trade (AXISBANK 0.471, POWERGRID 0.471, TATASTEEL 0.471).
+   * Those never reach 0.75, and a target that never qualifies gets NO baseline,
+   * hence no series for the whole day: a much worse failure than the offset the
+   * threshold was meant to catch.
+   *
+   * So the timing gate (BASELINE_MIN_IST) is the fix for stale opening prices,
+   * and this stays at 0.5 as a floor against the catastrophic case the previous
+   * OR-based rule could not see at all: one side entirely unpriced while the
+   * other is complete. Per-side evaluation is what makes that reachable.
+   */
+  BASELINE_MIN_SIDE_FRACTION: envNum('VEGA_BASELINE_MIN_SIDE_FRACTION', 0.5),
   MARKET_CLOSE_MIN: 930,    // 15:30 IST
 
   /**
@@ -284,7 +319,10 @@ module.exports = {
   BASE_RESOLUTION: '5s',
 
   TIMEZONE: 'Asia/Kolkata',
-  STORE_RAW_CHAINS: false,  // set true via env to also archive raw per-minute chains
+  // Wired to the env var the docs (and chainSnapshotStore's header) already
+  // promised. It was a hardcoded false, so VEGA_STORE_RAW_CHAINS=true silently
+  // did nothing and the archive stayed empty.
+  STORE_RAW_CHAINS: String(process.env.VEGA_STORE_RAW_CHAINS || '').trim().toLowerCase() === 'true',
 
   // -------------------------------------------------------------------------
   // Timeframes and stored resolution
