@@ -804,7 +804,12 @@ async function captureDayOpen(symbol, expiry) {
 // One sample (PHP: the vega_chart INSERT) — per {symbol, expiry}
 // ---------------------------------------------------------------------------
 
-function computeDiffs(symbol, expiry, at = new Date()) {
+/**
+ * @param {object} [opts]
+ * @param {boolean} [opts.atBaseline] TRUE only on the tick that captured the
+ *   day-open. See the block inside for why this exists.
+ */
+function computeDiffs(symbol, expiry, at = new Date(), opts = {}) {
   const chosen = expiryKey(expiry);
   const entry = state.get(stateKey(symbol, chosen));
   if (!entry?.open) { vlog(`Skipped ${symbol} ${chosen}: no day-open baseline yet`); return null; }
@@ -813,7 +818,32 @@ function computeDiffs(symbol, expiry, at = new Date()) {
   if (!built) return null;
 
   const start = startFor(symbol);
-  const currentChain = toGreekChain(built.snap.chain);
+
+  /**
+   * THE BASELINE SAMPLE IS THE BASELINE CHAIN — EXACTLY, NOT APPROXIMATELY.
+   *
+   * On the tick that captures the day-open, the "current" board and the
+   * baseline board are the same board: both are the market at that instant.
+   * Rebuilding it a second time does not make the sample more accurate, it
+   * makes it WRONG, because captureDayOpen() awaits persistDayOpen() — a real
+   * DB write — between the two builds. That await yields the event loop, the
+   * ticker updates the forward, and the second build differs from the first by
+   * whatever landed in between. The session's opening value then reads 0.007,
+   * or 0.15 on a fast open, instead of 0.
+   *
+   * That is a tick race, not a measurement. Reusing the captured chain removes
+   * it by construction: `current - open` over one identical chain is exactly
+   * 0/0/0, for the calls, for the puts and therefore for the Difference.
+   *
+   * `built` is still used for price and atmStrike, which are properties of the
+   * instant rather than of the comparison and should be as fresh as possible.
+   *
+   * Applies ONLY to the capturing tick. Every subsequent sample compares a
+   * genuinely current board against the frozen baseline, unchanged.
+   */
+  const currentChain = opts.atBaseline
+    ? entry.open.chain
+    : toGreekChain(built.snap.chain);
 
   // STABLE (default): the day-open basket is held for the session with a
   // hysteresis exit, so the sums are measured on the same contracts every sample
@@ -996,11 +1026,14 @@ async function runSample(now) {
      * returns null before 09:16, in which case computeDiffs correctly produces
      * nothing until the real baseline exists).
      */
+    // `atBaseline` is true only when THIS tick captured the day-open, which is
+    // the one tick whose sample must be exactly zero.
+    let atBaseline = false;
     if (needsDayOpenCapture(state.get(key), now)) {
-      await captureDayOpen(target.symbol, target.expiry);
+      atBaseline = !!(await captureDayOpen(target.symbol, target.expiry));
     }
 
-    const point = computeDiffs(target.symbol, target.expiry, sampledAt);
+    const point = computeDiffs(target.symbol, target.expiry, sampledAt, { atBaseline });
     if (!point) continue;
 
     const chain = point._chain;
@@ -1274,17 +1307,67 @@ function bucketByTimeframe(points, timeframe = '1m') {
    * every session visibly flickered. The loop below already handles a
    * single-element array correctly, so the special case was never needed.
    */
+  /**
+   * ===================================================================
+   * THE OPENING BUCKET KEEPS ITS **FIRST** VALUE. EVERY OTHER BUCKET
+   * KEEPS ITS **LAST**.
+   * ===================================================================
+   * Last-value-wins is right for a bar in progress — it is what makes a live
+   * chart and a reloaded one converge, and it is why every other bucket below
+   * still uses it. It is WRONG for the opening bar, and the reason is specific
+   * to what this series means.
+   *
+   * Every value here is `current - open`, so the session's first sample IS the
+   * baseline and is exactly 0/0/0 by construction. An index persists at 5s, so
+   * the 09:16 bucket holds twelve samples — and last-value-wins threw the zero
+   * away and published the 09:16:55 value under the 09:16 label. Measured on a
+   * synthetic session whose first sample was exactly zero:
+   *
+   *     1m  first bar -> call -0.96   put  0.576
+   *     15m first bar -> call -2.88   put  1.728
+   *
+   * The zero was computed correctly every single time and then discarded by
+   * aggregation. That is what made the curve start at a different level from a
+   * reference chart anchored at the open, and it is invisible in the data
+   * because the number published is a real sample — just the wrong one.
+   *
+   * `out.length === 0` is the test for "this is the opening bucket", which is
+   * exactly right and needs no session state: the opening bucket is the one
+   * that closes first. It therefore holds at 1m, 3m, 5m, 15m and every other
+   * tier without a per-timeframe special case.
+   *
+   * vegaStreamService.handleSamplerTick() implements the SAME rule on the live
+   * push — it emits the opening bucket once and refuses to revise it. Both
+   * sides must agree or a streaming chart and a reloaded one would disagree on
+   * bar one, which is the invariant bucketing.test.js exists to protect.
+   */
   if (!points.length) return points;
   const out = [];
   let bucket = null;
-  let last = null;
+  let firstInBucket = null;
+  let lastInBucket = null;
+
+  const closeBucket = () => {
+    // The opening bucket publishes the sample that OPENED it; the rest publish
+    // the sample that closed them.
+    const chosen = out.length === 0 ? firstInBucket : lastInBucket;
+    out.push({ ...chosen, time: bucket });
+  };
+
   for (const p of points) {
     const b = bucketStartFor(p.time, timeframe);
-    if (bucket !== null && b !== bucket) out.push({ ...last, time: bucket });
-    bucket = b;
-    last = p;
+    if (bucket === null) {
+      bucket = b; firstInBucket = p; lastInBucket = p;
+      continue;
+    }
+    if (b !== bucket) {
+      closeBucket();
+      bucket = b; firstInBucket = p; lastInBucket = p;
+      continue;
+    }
+    lastInBucket = p;
   }
-  if (last) out.push({ ...last, time: bucket });
+  if (bucket !== null) closeBucket();
   return out;
 }
 
@@ -1952,5 +2035,5 @@ module.exports = {
   TIMEFRAMES: cfg.TIMEFRAMES, startFor, strikeWindowFor, expiryCountFor, todayIst,
   // Same pattern as vegaStreamService: the day-rollover reset lives in the
   // in-memory buffer, so a test needs to reach it directly.
-  __test: { state, stateKey, appendLive },
+  __test: { state, stateKey, appendLive, computeDiffs },
 };

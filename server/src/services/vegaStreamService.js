@@ -227,6 +227,20 @@ async function handleSubscribe(client, { symbol, expiry, timeframe }) {
         && previous.expiry === chosen && previous.timeframe === tf
         ? previous.lastBucket
         : null,
+      /**
+       * The session's OPENING bucket, which must keep the value that opened it.
+       *
+       * bucketByTimeframe() publishes the first sample of the opening bucket and
+       * the last sample of every other one, because the opening sample IS the
+       * day-open baseline and is exactly 0/0/0. The push below has to implement
+       * the same rule or a streaming chart would revise bar one to a later
+       * sample while a reloaded chart kept the zero — the two disagreeing on the
+       * one bar the whole series is measured from.
+       *
+       * Filled from the back-fill when there is one, and otherwise by the first
+       * push (see handleSamplerTick).
+       */
+      firstBucket: null,
     });
 
     /**
@@ -268,6 +282,17 @@ async function handleSubscribe(client, { symbol, expiry, timeframe }) {
       return;
     }
     if (client.readyState !== 1 /* OPEN */) return;
+
+    /**
+     * The back-fill already contains the opening bar with its correct opening
+     * value, so pin it here: any later sample landing in that same bucket must
+     * not revise it. Without this the first live tick after a subscribe would
+     * overwrite the zero the back-fill just delivered.
+     */
+    if (points.length) {
+      const s = sessions.get(client);
+      if (s) s.firstBucket = points[0].time;
+    }
 
     sendToClient(client, {
       type: 'vega_subscribed',
@@ -405,6 +430,25 @@ function handleSamplerTick(updated) {
     }
 
     const bucket = vegaTimeseriesService.bucketStartFor(point.time, session.timeframe);
+
+    /**
+     * THE OPENING BUCKET IS PUBLISHED ONCE AND NEVER REVISED.
+     *
+     * Mirrors bucketByTimeframe()'s rule exactly. The first emission for a
+     * session establishes the opening bar; every later sample landing in that
+     * same bucket is dropped, so the bar keeps the value it opened with — which
+     * for the session's first bucket is the 0/0/0 baseline.
+     *
+     * Every bucket AFTER the opening one still revises on every sample, which
+     * is what keeps a bar in progress live and what makes live and history
+     * converge everywhere else.
+     */
+    if (session.firstBucket == null) {
+      session.firstBucket = bucket;
+    } else if (bucket === session.firstBucket) {
+      continue;
+    }
+
     const bucketAdvanced = session.lastBucket !== bucket;
     session.lastBucket = bucket;
 

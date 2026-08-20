@@ -103,9 +103,21 @@ test('live and history agree on every timeframe', () => {
   }
 });
 
-test('the in-progress bucket updates as samples arrive (no frozen bar)', () => {
-  // 1m timeframe fed 5s samples: the open bar must be revised 11 times, not once.
-  const points = samples(12);
+test('a bucket AFTER the opening one updates as samples arrive (no frozen bar)', () => {
+  /**
+   * RE-POINTED AT BUCKET 1, DELIBERATELY.
+   *
+   * This asserted bucket 0 until the opening-bucket rule landed. The opening
+   * bucket is now published ONCE and never revised, because its first sample is
+   * the day-open baseline (exactly 0/0/0) and last-value-wins was throwing that
+   * zero away — see bucketByTimeframe's header.
+   *
+   * Every OTHER bucket still revises on every sample, and that is what this
+   * test is actually for: proving a bar in progress stays live. Moving it to
+   * bucket 1 keeps that guarantee under test instead of deleting it. The
+   * opening bucket's own rule is asserted separately below.
+   */
+  const points = samples(24);   // bucket 0 (opening) + bucket 1
   const client = { readyState: 1, messages: [], send(raw) { this.messages.push(JSON.parse(raw)); } };
   stream.__test.sessions.set(client, {
     symbol: 'NIFTY', expiry: '2026-08-28', timeframe: '1m', lastBucket: null,
@@ -120,19 +132,58 @@ test('the in-progress bucket updates as samples arrive (no frozen bar)', () => {
   }
 
   const emitted = client.messages.filter((m) => m.type === 'vega_point');
-  assert.equal(emitted.length, 12, 'every sample must be emitted, not one per bucket');
 
-  const firstBucket = emitted.filter((m) => m.point.time === T0);
-  assert.equal(firstBucket.length, 12, 'all 12 samples fall in the first 1m bucket');
+  const opening = emitted.filter((m) => m.point.time === T0);
+  assert.equal(opening.length, 1, 'the OPENING bucket is published once and never revised');
+
+  const second = emitted.filter((m) => m.point.time === T0 + 60);
+  assert.equal(second.length, 12, 'every sample of a later bucket is still emitted');
 
   // The value carried must advance — this is what "not frozen" means.
   // DISPLAY_SIGN is configurable (VEGA_DISPLAY_SIGN); assert against the sign in
   // force rather than the old hardcoded -1, so the suite is valid either way.
   const S = require('../src/config/vegaConfig').DISPLAY_SIGN;
-  assert.equal(firstBucket[0].point.callVegaDiff, 100 * S, 'first sample (display-signed)');
-  assert.equal(firstBucket[11].point.callVegaDiff, 111 * S, 'twelfth sample (display-signed)');
-  assert.equal(firstBucket[0].bucketAdvanced, true, 'first sample opens the bucket');
-  assert.equal(firstBucket[11].bucketAdvanced, false, 'later samples revise it');
+  assert.equal(second[0].point.callVegaDiff, 112 * S, 'first sample of bucket 1 (display-signed)');
+  assert.equal(second[11].point.callVegaDiff, 123 * S, 'twelfth sample of bucket 1 (display-signed)');
+  assert.equal(second[0].bucketAdvanced, true, 'first sample opens the bucket');
+  assert.equal(second[11].bucketAdvanced, false, 'later samples revise it');
+});
+
+test('THE OPENING BUCKET KEEPS THE VALUE IT OPENED WITH', () => {
+  /**
+   * The defect this rule exists to fix. An index persists at 5s, so the opening
+   * 1m bucket holds twelve samples. The FIRST of them is the day-open baseline
+   * and is exactly 0/0/0; last-value-wins published the twelfth instead, so the
+   * chart's opening bar was ~55 seconds of market movement away from the zero
+   * the whole series is measured from.
+   */
+  const points = samples(24);
+  const history = vega.bucketByTimeframe(points, '1m');
+
+  assert.equal(history[0].callVegaDiff, 100, 'opening bucket keeps its FIRST sample');
+  assert.equal(history[1].callVegaDiff, 123, 'every later bucket keeps its LAST');
+
+  // And it holds at every tier, without a per-timeframe special case: the
+  // opening bucket is simply the one that closes first.
+  for (const tf of ['1m', '3m', '5m', '15m']) {
+    assert.equal(vega.bucketByTimeframe(points, tf)[0].callVegaDiff, 100,
+      `${tf}: the opening bar is the sample that opened the session`);
+  }
+});
+
+test('a zero opening sample SURVIVES aggregation at every timeframe', () => {
+  // The acceptance criterion stated directly: a session whose first sample is
+  // the baseline (0/0/0) must still read zero on the chart, at any tier.
+  const zeroOpen = samples(48).map((p, i) => (i === 0
+    ? { ...p, callVegaDiff: 0, putVegaDiff: 0, vegaDiff: 0 }
+    : p));
+
+  for (const tf of TIMEFRAMES) {
+    const first = vega.bucketByTimeframe(zeroOpen, tf)[0];
+    assert.equal(first.callVegaDiff, 0, `${tf}: call opens at zero`);
+    assert.equal(first.putVegaDiff, 0, `${tf}: put opens at zero`);
+    assert.equal(first.vegaDiff, 0, `${tf}: difference opens at zero`);
+  }
 });
 
 test('the closed bucket holds the LAST sample, matching what is persisted', () => {
@@ -140,12 +191,19 @@ test('the closed bucket holds the LAST sample, matching what is persisted', () =
   const live = runLive(points, '1m');
   const history = vega.bucketByTimeframe(points, '1m');
 
+  const S = require('../src/config/vegaConfig').DISPLAY_SIGN;
   assert.equal(live.length, 2);
-  // Raw stored value of the closing sample of bucket 0 is index 11 -> 111.
-  assert.equal(history[0].callVegaDiff, 111, 'history keeps the last sample of the bucket');
-  // decorate() applies DISPLAY_SIGN, so the served value is the negation.
-  assert.equal(live[0].callVegaDiff, 111 * require('../src/config/vegaConfig').DISPLAY_SIGN,
-    'live converges on the same sample');
+
+  // Bucket 0 is the OPENING bucket: it keeps the sample that opened it (index
+  // 0 -> 100), because that sample is the day-open baseline.
+  assert.equal(history[0].callVegaDiff, 100, 'opening bucket keeps its first sample');
+  assert.equal(live[0].callVegaDiff, 100 * S, 'live agrees, display-signed');
+
+  // Bucket 1 is an ordinary bucket: last-value-wins, index 23 -> 123. This is
+  // the guarantee the test was originally written for and it is unchanged.
+  assert.equal(history[1].callVegaDiff, 123, 'a later bucket keeps its LAST sample');
+  assert.equal(live[1].callVegaDiff, 123 * S, 'live converges on the same sample');
+
   assert.equal(live[0].time, T0);
   assert.equal(live[1].time, T0 + 60);
 });
