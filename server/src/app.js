@@ -146,13 +146,32 @@ app.get('/api/health/deep', async (req, res) => {
   try {
     const vega = require('./services/vegaTimeseriesService');
     const stats = vega.getStats();
+    /**
+     * `ok` USED TO MEAN "IS THE CRON RUNNING", WHICH IS NOT HEALTH.
+     *
+     * On 2026-08-20 SENSEX produced 16 samples and then nothing for six hours,
+     * and this block reported ok:true throughout — because the cron WAS
+     * running. It ran perfectly and produced nothing for one instrument. The
+     * count in `series` did not move either: the entry still existed, holding
+     * a restored morning of points that would never grow.
+     *
+     * Health now means "every tracked target is actually producing", and a
+     * dark instrument names itself and says why. Unauthenticated, so it can be
+     * answered without an SSH session — which is what made the original
+     * stoppage undiagnosable after the logs rolled.
+     */
+    const stale = stats.stale || [];
     out.checks.sampler = {
-      ok: stats.sampling,
+      ok: stats.sampling && stale.length === 0,
       sampling: stats.sampling,
       window: stats.window,
       skippedTicks: stats.skippedTicks,
       series: stats.underlyings.length,
+      staleCount: stale.length,
+      stale,
+      skipped: stats.skipped || [],
     };
+    if (stale.length) out.status = 'degraded';
   } catch (err) {
     out.checks.sampler = { ok: false, error: err.message };
   }

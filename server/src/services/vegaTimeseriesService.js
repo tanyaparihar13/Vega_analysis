@@ -78,7 +78,39 @@ function vlog(reason, force = false) {
   console.log(`[VegaSeries] ${reason}`);
 }
 
-// 'SYMBOL|YYYY-MM-DD' -> { symbol, expiry, open: <baseline|null>, series: [rawPoint] }
+/**
+ * WHY A TARGET PRODUCED NOTHING, per symbol — the diagnostic that did not exist.
+ *
+ * On 2026-08-20 SENSEX recorded 16 samples and then stopped for six hours while
+ * /api/health/deep reported `sampler.ok: true` the whole time. `ok` was
+ * `stats.sampling` — "is the cron running" — and it was: the cron ran perfectly
+ * and produced nothing for one instrument. The only trace was a vlog()
+ * throttled to once a minute, inside PM2's log file.
+ *
+ * An index can go dark for an entire session with every health signal green.
+ * That is a worse defect than whatever stopped SENSEX, because it is what made
+ * the stoppage both invisible AND undiagnosable after the fact — by the time
+ * anyone looks, the logs have rolled and the process state is gone.
+ *
+ * Every early return on the sampling path now records WHY here, and getStats()
+ * and health-deep surface it. The answer becomes one unauthenticated HTTP call
+ * instead of an SSH session and a log grep.
+ */
+const skipReasons = new Map();   // 'SYMBOL' -> { reason, expiry, at }
+
+function noteSkip(symbol, reason, expiry = null) {
+  skipReasons.set(String(symbol).toUpperCase(), {
+    reason, expiry, at: Math.floor(Date.now() / 1000),
+  });
+}
+
+/** Cleared the moment a symbol samples again, so a stale reason can never
+ *  outlive the condition it described. */
+function clearSkip(symbol) {
+  skipReasons.delete(String(symbol).toUpperCase());
+}
+
+// 'SYMBOL|YYYY-MM-DD' -> { symbol, expiry, date, open, series: [rawPoint], lastSampleAt }
 const state = new Map();
 
 /**
@@ -479,14 +511,30 @@ function ensureSubscriptions() {
 
 function buildChainFor(symbol, expiry) {
   const c = resolveSymbol(symbol);
-  if (!c) { vlog(`Skipped ${symbol}: unknown underlying`); return null; }
-  if (!instrumentService.isReady()) { vlog(`Skipped ${symbol}: instrument master not ready`); return null; }
+  if (!c) { noteSkip(symbol, 'unknown-underlying'); vlog(`Skipped ${symbol}: unknown underlying`); return null; }
+  if (!instrumentService.isReady()) {
+    noteSkip(symbol, 'instrument-master-not-ready');
+    vlog(`Skipped ${symbol}: instrument master not ready`); return null;
+  }
 
   const chosen = expiryKey(expiry);
-  if (!chosen) { vlog(`Skipped ${c.key}: no expiry available`); return null; }
+  if (!chosen) { noteSkip(c.key, 'no-expiry-available'); vlog(`Skipped ${c.key}: no expiry available`); return null; }
 
   const spotTick = c.spotToken != null ? latestTicksRef?.get(c.spotToken) : null;
-  if (spotTick?.lastPrice == null) { vlog(`Skipped ${c.key}: no live spot tick (feed idle?)`); return null; }
+  if (spotTick?.lastPrice == null) {
+    /**
+     * THE SUSPECTED SENSEX PATH, now named instead of inferred.
+     *
+     * Without a spot tick the chain cannot be centred, so no baseline is
+     * captured and no sample is ever produced — silently, for the rest of the
+     * day, with the retry succeeding only if the tick eventually arrives.
+     * Recording the token is the difference between "an index is dark" and
+     * "an index is dark BECAUSE this token is not ticking", which is the whole
+     * distance between a guess and a root cause.
+     */
+    noteSkip(c.key, `no-spot-tick(token=${c.spotToken})`, chosen);
+    vlog(`Skipped ${c.key}: no live spot tick (feed idle?)`); return null;
+  }
 
   try {
     const snap = optionChainService.buildChain({
@@ -761,6 +809,7 @@ async function captureDayOpen(symbol, expiry) {
     if (!fresh.length) return null;
 
     if (!isUsableOpenChain(fresh, cfg.BASELINE_MIN_SIDE_FRACTION)) {
+      noteSkip(c.key, 'open-chain-unusable(greeks-mostly-null)', chosen);
       vlog(`Rejected day-open for ${c.key} ${chosen}: Greeks mostly null (stale ticks?) — retrying next tick`, true);
       return null;
     }
@@ -812,7 +861,10 @@ async function captureDayOpen(symbol, expiry) {
 function computeDiffs(symbol, expiry, at = new Date(), opts = {}) {
   const chosen = expiryKey(expiry);
   const entry = state.get(stateKey(symbol, chosen));
-  if (!entry?.open) { vlog(`Skipped ${symbol} ${chosen}: no day-open baseline yet`); return null; }
+  if (!entry?.open) {
+    noteSkip(symbol, 'no-day-open-baseline', chosen);
+    vlog(`Skipped ${symbol} ${chosen}: no day-open baseline yet`); return null;
+  }
 
   const built = buildChainFor(symbol, chosen);
   if (!built) return null;
@@ -906,6 +958,13 @@ function appendLive(key, entry, point) {
   const last = entry.series[entry.series.length - 1];
   if (last && last.time === point.time) entry.series[entry.series.length - 1] = point;
   else entry.series.push(point);
+
+  // The freshness signal health-deep reads. Stamped on the ENTRY rather than
+  // derived from the last buffered point, because the buffer is bounded and a
+  // symbol that stopped producing keeps its old tail forever — which is exactly
+  // how a dark instrument went on looking healthy.
+  entry.lastSampleAt = Math.floor(Date.now() / 1000);
+  clearSkip(entry.symbol);
 
   // Bounded — an unbounded array per instrument is how a recorder that runs all
   // day becomes a memory leak.
@@ -1937,6 +1996,41 @@ async function purgeOldHistory(days = cfg.RETENTION_DAYS) {
   return { retentionDays: keep, deleted: out };
 }
 
+/**
+ * Tracked targets that have gone quiet DURING MARKET HOURS.
+ *
+ * "Quiet" is measured from the entry's own lastSampleAt, so a symbol that
+ * stopped producing is caught even though its restored buffer still holds a
+ * full morning of points — which is exactly the state SENSEX was in while
+ * every health check reported green.
+ *
+ * Only meaningful inside the sampling window: outside it EVERY target is
+ * legitimately quiet, and reporting them all as stale overnight would train
+ * whoever reads this to ignore it.
+ */
+function staleTargets(now = new Date(), thresholdSeconds = cfg.STALE_SAMPLE_SECONDS) {
+  if (!isSamplingWindow(now)) return [];
+  const nowSec = Math.floor(now.getTime() / 1000);
+  const today = istParts(now).date;
+
+  const out = [];
+  for (const entry of state.values()) {
+    if (entry.date !== today) continue;
+    const age = entry.lastSampleAt ? nowSec - entry.lastSampleAt : null;
+    // Never sampled at all this session, or not for longer than the threshold.
+    if (age === null || age > thresholdSeconds) {
+      out.push({
+        symbol: entry.symbol,
+        expiry: entry.expiry,
+        ageSeconds: age,
+        hasBaseline: !!entry.open,
+        reason: skipReasons.get(entry.symbol)?.reason ?? 'unknown',
+      });
+    }
+  }
+  return out;
+}
+
 function getStats() {
   return {
     sampling: sampleTask !== null,
@@ -1980,7 +2074,12 @@ function getStats() {
       hasBaseline: !!e.open, points: e.series.length,
       resolution: persistResolutionFor(e.symbol),
       start: startFor(e.symbol),
+      lastSampleAt: e.lastSampleAt ?? null,
+      ageSeconds: e.lastSampleAt ? Math.floor(Date.now() / 1000) - e.lastSampleAt : null,
     })),
+    // Why each silent target is silent. Empty on a healthy system.
+    skipped: [...skipReasons.entries()].map(([symbol, v]) => ({ symbol, ...v })),
+    stale: staleTargets(),
   };
 }
 
@@ -2025,7 +2124,7 @@ module.exports = {
   registerDemand, releaseDemand, onTick,
   resolveSymbol, isIndex, persistResolutionFor, canServe, servableTimeframes,
   storedResolutions, bucketByTimeframe, bucketStartFor, isUsableOpenChain, tradingDateOf,
-  needsDayOpenCapture, baselineLateness,
+  needsDayOpenCapture, baselineLateness, staleTargets,
   reanchorPoints, intradayAnchorFor, istMomentOf, liveAnchorBase,
   loadDelayed, PUBLIC_DELAY_MINUTES,
   // Exported so the WebSocket push uses the SAME sign convention and trend

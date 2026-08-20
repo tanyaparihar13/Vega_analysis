@@ -293,6 +293,17 @@ module.exports = {
   BASELINE_MAX_IST: envNum('VEGA_BASELINE_MAX_IST', 565),
 
   /**
+   * How long a tracked target may go without a sample, during market hours,
+   * before it is reported as STALE (default 180s).
+   *
+   * Indices persist at 5s and the slowest stock at 1m, so three minutes is many
+   * missed samples for anything — comfortably clear of one skipped tick or a
+   * brief feed hiccup, and far short of the six hours SENSEX was dark on
+   * 2026-08-20 while every health check stayed green.
+   */
+  STALE_SAMPLE_SECONDS: envNum('VEGA_STALE_SAMPLE_SECONDS', 180),
+
+  /**
    * INTRADAY VERIFICATION BASELINE — a temporary, date-scoped re-origin.
    *
    *     VEGA_INTRADAY_BASELINE=2026-08-20:14:00
