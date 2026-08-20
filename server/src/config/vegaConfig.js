@@ -267,6 +267,32 @@ module.exports = {
   BASELINE_MIN_IST: envNum('VEGA_BASELINE_MIN_IST', 556),
 
   /**
+   * Latest minute at which a capture still counts as THE DAY'S OPEN (09:25 IST).
+   *
+   * BASELINE_MIN_IST was a floor with no ceiling, and the asymmetry was a real
+   * bug rather than an oversight. Every plotted value is `current - open`, so
+   * the baseline is the origin of the whole chart. A process that starts at
+   * 09:30 — a deploy, a crash restart, an instrument first tracked mid-session
+   * — found no baseline, captured one from the board in front of it, and
+   * presented that as the session's open. The result is a chart whose shape is
+   * correct and whose LEVEL is silently wrong by however far the market moved
+   * before the capture, with nothing anywhere saying so.
+   *
+   * Measured on 2026-08-20: a 09:30 restart put the Call series a near-constant
+   * +5.42 (sd 0.28) away from the same series anchored at 09:15, and the Put
+   * series -0.41 (sd 0.27). A constant additive offset is the signature of a
+   * wrong ORIGIN; a wrong calculation would scale with the value instead.
+   *
+   * Past this minute the capture is still taken — refusing would leave the day
+   * with no chart at all, and a correct shape is worth more than nothing — but
+   * it is MARKED late, reconstructed from the raw-chain archive when one
+   * exists, and surfaced through the API so the UI can say what the numbers are
+   * measured from. Lateness is DERIVED from the stored `captured_at`, so no
+   * schema change and no historical row is touched.
+   */
+  BASELINE_MAX_IST: envNum('VEGA_BASELINE_MAX_IST', 565),
+
+  /**
    * Minimum fraction of the board that must be priced ON EACH SIDE before the
    * day-open baseline is accepted.
    *

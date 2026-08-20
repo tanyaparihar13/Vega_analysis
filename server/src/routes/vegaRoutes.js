@@ -142,10 +142,24 @@ router.get('/:symbol/series', authenticate, requirePremium, async (req, res) => 
       expiry: expiry || (latest?.expiry ?? dayOpen?.expiry ?? null),
       requestedExpiry: expiryParam.value,
       expiries: available,
+      /**
+       * WHAT THE SERIES IS MEASURED FROM.
+       *
+       * Every plotted value is `current - open`, so this is the chart's origin.
+       * `late` / `capturedAtIst` / `minutesAfterOpen` are derived from the
+       * stored `captured_at` and say whether that origin really is the session
+       * open. A baseline taken at 09:30 leaves the shape correct and the level
+       * offset by the morning's move — invisible in the numbers, and the reason
+       * a correct implementation can look broken beside a reference chart. The
+       * client surfaces it rather than letting the reader assume 09:15.
+       */
       dayOpen: dayOpen
         ? { callVega: dayOpen.callVega, putVega: dayOpen.putVega,
             callStrikes: dayOpen.callStrikes, putStrikes: dayOpen.putStrikes,
-            capturedAt: dayOpen.capturedAt ? String(dayOpen.capturedAt) : null }
+            capturedAt: dayOpen.capturedAt ? String(dayOpen.capturedAt) : null,
+            capturedAtIst: dayOpen.capturedAtIst ?? null,
+            minutesAfterOpen: dayOpen.minutesAfterOpen ?? null,
+            late: dayOpen.late ?? false }
         : null,
       latestTrend: latest ? { label: latest.trend, key: latest.trendKey, color: latest.trendColor } : null,
       count: points.length,

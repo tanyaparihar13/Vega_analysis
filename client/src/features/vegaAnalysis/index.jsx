@@ -902,6 +902,19 @@ export default function VegaAnalysis() {
 
   const expiryText = activeExpiry ? fmtDate(activeExpiry) : null;
 
+  /**
+   * Only shown when the baseline genuinely missed its window — `late` is
+   * derived server-side from the stored `captured_at` against BASELINE_MAX_IST,
+   * so a normal 09:16 capture says nothing at all here.
+   */
+  const baseline = data?.dayOpen;
+  const baselineNotice = baseline?.late && points.length
+    ? `Day-open baseline for ${symbol} was captured at ${baseline.capturedAtIst} IST`
+      + `${baseline.minutesAfterOpen != null ? `, ${baseline.minutesAfterOpen} minutes after the 09:15 open` : ''}`
+      + `. These values are measured from that point, not from the open — the shape of the`
+      + ` curve is correct, but the level is offset by the move before the baseline was taken.`
+    : null;
+
   const emptyMessage = !isToday
     ? `No data stored for ${symbol}${expiryText ? ` (expiry ${expiryText})` : ''} on ${fmtDate(date)}. It may have been a weekend or a market holiday, it may predate the recorder, or that expiry was not being recorded on that day.`
     : data?.hasBaseline
@@ -1072,6 +1085,31 @@ export default function VegaAnalysis() {
           className="rounded-xl border border-vega-red/40 bg-vega-red-soft p-4 text-sm font-medium text-vega-red"
         >
           {error}
+        </div>
+      )}
+
+      {/*
+        WHAT THE NUMBERS ARE MEASURED FROM.
+
+        Every value on this page is `current - day-open`, so the baseline is the
+        chart's origin. When the recorder could not take it at 09:16 — the
+        process was down, or this instrument was first tracked mid-session — the
+        series is anchored wherever the capture landed. The SHAPE stays correct;
+        the LEVEL is offset by however far the market moved first.
+
+        That offset is invisible in the data and it is the single most
+        misleading failure this page can have: on 2026-08-20 a 09:30 anchor put
+        the Call series a near-constant +5.42 away from the same curve anchored
+        at 09:15, which reads exactly like a broken calculation. Saying so is
+        the difference between a chart that is honest about its origin and one
+        that quietly implies 09:15.
+      */}
+      {!error && baselineNotice && (
+        <div
+          role="status"
+          className="rounded-xl border border-amber-300/60 bg-amber-50 p-3 text-sm font-medium text-amber-900"
+        >
+          {baselineNotice}
         </div>
       )}
 

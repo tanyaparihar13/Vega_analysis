@@ -519,6 +519,40 @@ function buildChainFor(symbol, expiry) {
  * FOR THIS SESSION". Extracted and exported so the distinction is asserted
  * against this function rather than against a copy of the expression in a test.
  */
+/**
+ * How late a stored baseline was taken, DERIVED from its `captured_at`.
+ *
+ * Every plotted value is `current - open`, so the baseline is the origin of the
+ * chart. A baseline taken at 09:30 instead of 09:16 does not make the curve
+ * wrong — the SHAPE is untouched — it moves the whole series by however far the
+ * market travelled in between. That offset is invisible in the data and is
+ * exactly what makes a correct implementation look broken next to a reference
+ * chart anchored at the open.
+ *
+ * Derived rather than stored: `captured_at` has been written since the table
+ * existed, so every historical row can be judged by this without a schema
+ * change and without touching a single stored value.
+ *
+ * `capturedAt` is a UTC DATETIME string (persistDayOpen -> fmtSql -> toISOString)
+ * or a Date. Both are read as UTC and compared in IST minutes.
+ *
+ * @returns {{capturedAtIst:string|null, minutesAfterOpen:number|null, late:boolean}}
+ */
+function baselineLateness(capturedAt) {
+  if (!capturedAt) return { capturedAtIst: null, minutesAfterOpen: null, late: false };
+  const ms = capturedAt instanceof Date
+    ? capturedAt.getTime()
+    : Date.parse(`${String(capturedAt).replace(' ', 'T')}Z`);
+  if (!Number.isFinite(ms)) return { capturedAtIst: null, minutesAfterOpen: null, late: false };
+
+  const { minutes } = istParts(new Date(ms));
+  return {
+    capturedAtIst: fmtMin(minutes),
+    minutesAfterOpen: minutes - cfg.MARKET_OPEN_MIN,
+    late: minutes > cfg.BASELINE_MAX_IST,
+  };
+}
+
 function needsDayOpenCapture(entry, now = new Date()) {
   if (!entry?.open) return true;
   return entry.date !== istParts(now).date;
@@ -568,18 +602,70 @@ async function captureDayOpen(symbol, expiry) {
    * yesterday's close. Recording itself still begins at MARKET_OPEN_MIN; only
    * the baseline waits. Returning null here just defers to the next tick.
    */
-  if (istParts().minutes < cfg.BASELINE_MIN_IST) return null;
-
-  const built = buildChainFor(c.key, chosen);
-  if (!built) return null;
+  const nowMinutes = istParts().minutes;
+  if (nowMinutes < cfg.BASELINE_MIN_IST) return null;
 
   const start = startFor(c.key);
-  const openChain = toGreekChain(built.snap.chain);
-  if (!openChain.length) return null;
 
-  if (!isUsableOpenChain(openChain, cfg.BASELINE_MIN_SIDE_FRACTION)) {
-    vlog(`Rejected day-open for ${c.key} ${chosen}: Greeks mostly null (stale ticks?) — retrying next tick`, true);
-    return null;
+  /**
+   * ===================================================================
+   * LATE CAPTURE: RECONSTRUCT THE REAL OPEN, OR SAY THAT WE COULD NOT.
+   * ===================================================================
+   * Past BASELINE_MAX_IST this is no longer "the open" — the process was down
+   * at 09:16, or this instrument was first tracked mid-session. Taking the
+   * board in front of us and calling it the day's open re-origins the entire
+   * `current - open` series: the SHAPE stays right and the LEVEL is wrong by
+   * however far the market moved first, with nothing saying so. That is what
+   * made 2026-08-20 read +5.42 away from the same curve anchored at 09:15.
+   *
+   * If the raw-chain archive is on, the real 09:16 chain is already on disk and
+   * is used instead — the only genuinely correct recovery. Otherwise the
+   * capture still happens (a correct shape beats an empty chart) but it is
+   * marked late and reported, so the UI can state what the numbers are measured
+   * from rather than implying 09:15.
+   */
+  let openChain = null;
+  let capturedAt = new Date();
+  let reconstructed = false;
+  const late = nowMinutes > cfg.BASELINE_MAX_IST;
+
+  if (late) {
+    const archived = await chainSnapshotStore
+      .earliestChain(c.key, istParts().date, chosen, fmtMin(cfg.BASELINE_MIN_IST) + ':00')
+      .catch(() => null);
+
+    if (archived && isUsableOpenChain(archived.chain, cfg.BASELINE_MIN_SIDE_FRACTION)) {
+      openChain = toGreekChain(archived.chain);
+      // The archived row's own timestamp, so the recovered baseline reports
+      // when it was really taken rather than when it was recovered.
+      capturedAt = new Date(`${String(archived.sampledAt).replace(' ', 'T')}Z`);
+      reconstructed = true;
+      console.log(`[VegaSeries] Day-open RECONSTRUCTED for ${c.key} ${chosen} from the raw-chain `
+        + `archive at ${archived.sampledAt} UTC — the live board was ${nowMinutes - cfg.BASELINE_MIN_IST} `
+        + `minute(s) too late to be the open`);
+    }
+  }
+
+  if (!openChain) {
+    const built = buildChainFor(c.key, chosen);
+    if (!built) return null;
+
+    const fresh = toGreekChain(built.snap.chain);
+    if (!fresh.length) return null;
+
+    if (!isUsableOpenChain(fresh, cfg.BASELINE_MIN_SIDE_FRACTION)) {
+      vlog(`Rejected day-open for ${c.key} ${chosen}: Greeks mostly null (stale ticks?) — retrying next tick`, true);
+      return null;
+    }
+    openChain = fresh;
+
+    if (late) {
+      console.warn(`[VegaSeries] LATE day-open for ${c.key} ${chosen}: captured at `
+        + `${fmtMin(nowMinutes)} IST, ${nowMinutes - cfg.MARKET_OPEN_MIN} minute(s) after the bell, `
+        + `and no raw-chain archive to reconstruct from (VEGA_STORE_RAW_CHAINS=`
+        + `${cfg.STORE_RAW_CHAINS}). Today's ${c.key} series is measured from `
+        + `${fmtMin(nowMinutes)}, NOT from the open — the shape is correct, the level is offset.`);
+    }
   }
 
   // The strike lists selected AT OPEN — used only by 'frozen' mode.
@@ -588,8 +674,8 @@ async function captureDayOpen(symbol, expiry) {
   const open = {
     date: istParts().date,
     symbol: c.key,
-    expiry: built.expiry,
-    capturedAt: new Date(),
+    expiry: chosen,
+    capturedAt,
     chain: openChain,
     frozenCallStrikes: frozen.callStrikes,
     frozenPutStrikes: frozen.putStrikes,
@@ -602,7 +688,8 @@ async function captureDayOpen(symbol, expiry) {
     console.warn(`[VegaSeries] Day-open persist failed for ${c.key} ${chosen}:`, err.message));
 
   console.log(`[VegaSeries] Day-open captured for ${c.key} ${chosen}: ${openChain.length} strikes ` +
-    `(${frozen.callStrikes.length} call / ${frozen.putStrikes.length} put eligible at open)`);
+    `(${frozen.callStrikes.length} call / ${frozen.putStrikes.length} put eligible at open)` +
+    `${reconstructed ? ' [reconstructed from archive]' : ''}${late && !reconstructed ? ' [LATE]' : ''}`);
   return open;
 }
 
@@ -1174,7 +1261,8 @@ async function loadDayOpenMeta(symbol, date, expiry = null) {
       { symbol: String(symbol).toUpperCase(), date, expiry: expiryKey(expiry) || null }
     );
     if (!rows.length) return null;
-    return { expiry: expiryKey(rows[0].expiry), capturedAt: rows[0].captured_at || null };
+    const capturedAt = rows[0].captured_at || null;
+    return { expiry: expiryKey(rows[0].expiry), capturedAt, ...baselineLateness(capturedAt) };
   } catch (err) {
     console.warn(`[VegaSeries] Day-open lookup failed for ${symbol} ${date}:`, err.message);
     return null;
@@ -1682,7 +1770,7 @@ module.exports = {
   registerDemand, releaseDemand, onTick,
   resolveSymbol, isIndex, persistResolutionFor, canServe, servableTimeframes,
   storedResolutions, bucketByTimeframe, bucketStartFor, isUsableOpenChain, tradingDateOf,
-  needsDayOpenCapture,
+  needsDayOpenCapture, baselineLateness,
   loadDelayed, PUBLIC_DELAY_MINUTES,
   // Exported so the WebSocket push uses the SAME sign convention and trend
   // derivation as every other reader — see decorate()'s header.

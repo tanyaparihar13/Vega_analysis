@@ -77,4 +77,50 @@ async function getSnapshot(symbol, date, sampledAt) {
   }
 }
 
-module.exports = { persist, getSnapshot, enabled: () => STORE_RAW_CHAINS };
+/**
+ * The EARLIEST archived chain for a session, at or after `notBefore`.
+ *
+ * This is the correct recovery for a day-open baseline that was missed because
+ * the process was down at 09:16. The alternative — capturing whatever board is
+ * in front of us at 09:30 and calling it the open — silently re-origins the
+ * whole day's `current - open` series. If the archive is on, the real 09:16
+ * chain is sitting right here and should be used instead of inventing one.
+ *
+ * `notBefore` is a 'HH:MM:SS' IST wall-clock time. sampled_at is stored in UTC
+ * (persistSamples -> fmtSql -> toISOString), so the comparison is done in UTC
+ * to match the column, exactly as loadDelayed does.
+ *
+ * Returns null when the archive is off, the table is missing, or the session
+ * has nothing at or after the cutoff — every one of which is an ordinary
+ * condition the caller must handle, not an error.
+ *
+ * @returns {Promise<{chain:Array, sampledAt:string}|null>}
+ */
+async function earliestChain(symbol, date, expiry, notBefore = '09:16:00') {
+  if (!STORE_RAW_CHAINS) return null;
+  try {
+    // 'YYYY-MM-DDTHH:MM:SS+05:30' -> the UTC the column actually holds.
+    const cutoff = new Date(`${date}T${notBefore}+05:30`)
+      .toISOString().slice(0, 19).replace('T', ' ');
+
+    const [rows] = await db.query(
+      `SELECT chain, sampled_at FROM vega_chain_snapshots
+        WHERE symbol = :symbol AND snapshot_date = :date
+          AND (:expiry IS NULL OR expiry = :expiry)
+          AND sampled_at >= :cutoff
+        ORDER BY sampled_at ASC
+        LIMIT 1`,
+      { symbol: String(symbol).toUpperCase(), date, expiry: expiry || null, cutoff }
+    );
+    if (!rows.length) return null;
+    const chain = typeof rows[0].chain === 'string' ? JSON.parse(rows[0].chain) : rows[0].chain;
+    return Array.isArray(chain) && chain.length
+      ? { chain, sampledAt: String(rows[0].sampled_at) }
+      : null;
+  } catch (err) {
+    console.warn('[ChainSnapshot] earliestChain failed:', err.message);
+    return null;
+  }
+}
+
+module.exports = { persist, getSnapshot, earliestChain, enabled: () => STORE_RAW_CHAINS };
