@@ -107,6 +107,15 @@ router.get('/:symbol/series', authenticate, requirePremium, async (req, res) => 
       unavailable,
       date: resolvedDate,
       requestedDate: date,
+      /**
+       * ONE SELECTED TRADING DATE = ONE DATASET.
+       *
+       * loadByDate() proves every point below belongs to this session before it
+       * returns, so the response states the day it describes rather than
+       * leaving a consumer to infer it from the points (which may legitimately
+       * be empty) or — the mistake this guards against — from the expiry.
+       */
+      tradingDate: resolvedDate,
       live,
       source: live && !fromStore ? 'memory' : 'database',
       strikeMode: cfg.STRIKE_MODE,                       // 'stable' | 'frozen' | 'dynamic'

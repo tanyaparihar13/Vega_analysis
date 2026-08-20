@@ -503,6 +503,27 @@ function buildChainFor(symbol, expiry) {
 // Day-open capture (PHP: the first market_open row of the day) — per expiry
 // ---------------------------------------------------------------------------
 
+/**
+ * Must this slot capture a day-open baseline before it can be sampled?
+ *
+ * A NAMED PREDICATE BECAUSE THE OBVIOUS CONDITION IS THE WRONG ONE. The guard
+ * in runSample used to read `!entry?.open` — "capture if there is no baseline"
+ * — which is false precisely when the held baseline is STALE. captureDayOpen()
+ * is where the day-rollover reset lives, so the one function that could have
+ * noticed was skipped exactly when it was needed, and the new session's first
+ * sample was measured against the PREVIOUS session's chain, then kept and
+ * persisted. That row is today-dated and carries no trace of the mistake, so no
+ * date filter anywhere downstream can catch it.
+ *
+ * The question is therefore not "is there a baseline" but "is there a baseline
+ * FOR THIS SESSION". Extracted and exported so the distinction is asserted
+ * against this function rather than against a copy of the expression in a test.
+ */
+function needsDayOpenCapture(entry, now = new Date()) {
+  if (!entry?.open) return true;
+  return entry.date !== istParts(now).date;
+}
+
 async function captureDayOpen(symbol, expiry) {
   const c = resolveSymbol(symbol);
   if (!c) return null;
@@ -762,7 +783,28 @@ async function runSample(now) {
     if (!target.watched && !persistNow) continue;
 
     const key = stateKey(target.symbol, target.expiry);
-    if (!state.get(key)?.open) await captureDayOpen(target.symbol, target.expiry);
+
+    /**
+     * THE STALENESS CHECK MUST DECIDE THIS, NOT THE PRESENCE OF A BASELINE.
+     *
+     * captureDayOpen() is where the day-rollover reset lives — but it was only
+     * reached when `entry.open` was falsy, which is exactly the condition a
+     * STALE baseline fails to meet. So on the first tick of a new session the
+     * held entry still carried yesterday's `open`, this guard read it as "the
+     * baseline is already taken", and computeDiffs() went on to measure the new
+     * day's first sample against the PREVIOUS day's chain. appendLive() then
+     * reset the buffer and kept that one point, which was persisted too — a
+     * today-dated row that no date filter can catch, because its timestamp is
+     * genuinely today's. One bad sample per symbol/expiry per day.
+     *
+     * Asking about the DATE as well closes it: a stale entry now enters
+     * captureDayOpen(), which resets it and captures a fresh baseline (or
+     * returns null before 09:16, in which case computeDiffs correctly produces
+     * nothing until the real baseline exists).
+     */
+    if (needsDayOpenCapture(state.get(key), now)) {
+      await captureDayOpen(target.symbol, target.expiry);
+    }
 
     const point = computeDiffs(target.symbol, target.expiry, sampledAt);
     if (!point) continue;
@@ -1640,6 +1682,7 @@ module.exports = {
   registerDemand, releaseDemand, onTick,
   resolveSymbol, isIndex, persistResolutionFor, canServe, servableTimeframes,
   storedResolutions, bucketByTimeframe, bucketStartFor, isUsableOpenChain, tradingDateOf,
+  needsDayOpenCapture,
   loadDelayed, PUBLIC_DELAY_MINUTES,
   // Exported so the WebSocket push uses the SAME sign convention and trend
   // derivation as every other reader — see decorate()'s header.

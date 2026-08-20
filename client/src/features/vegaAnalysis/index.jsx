@@ -679,7 +679,7 @@ export default function VegaAnalysis() {
    * user who is reading last Tuesday.
    */
   const streamEnabled = isToday && expiryReady && !!expiry;
-  const stream = useVegaStream({ symbol, expiry, timeframe, enabled: streamEnabled });
+  const stream = useVegaStream({ symbol, expiry, timeframe, tradingDate: date, enabled: streamEnabled });
 
   // ---- expiries for the current {symbol, date} --------------------------
   useEffect(() => {
@@ -810,7 +810,21 @@ export default function VegaAnalysis() {
    * arrangement of state in which they can disagree — synchronisation is a
    * property of the data flow here, not something kept up by effects.
    */
-  const points = streamHealthy ? stream.points : (data?.points ?? []);
+  /**
+   * ONE SELECTED TRADING DATE = ONE DATASET, at the last hop too.
+   *
+   * `requestSeq` already discards an out-of-order /series response, so `data`
+   * is the newest reply — but "newest reply" and "reply for the date currently
+   * selected" are not the same thing while the request for a newly picked date
+   * is still in flight. `data` is then the complete, correct dataset for the
+   * PREVIOUS date, and rendering it puts yesterday's rows under today's label
+   * for as long as the round trip takes. The server echoes the date it
+   * resolved, so this is an exact check rather than an inference. An empty
+   * frame is the right answer for that gap: the date picker is the one control
+   * where briefly showing the wrong day is worse than briefly showing nothing.
+   */
+  const storedPoints = data && data.date === date ? (data.points ?? []) : [];
+  const points = streamHealthy ? stream.points : storedPoints;
   const latest = points.length ? points[points.length - 1] : null;
   const tableRows = useMemo(() => [...points].reverse(), [points]); // newest first
 

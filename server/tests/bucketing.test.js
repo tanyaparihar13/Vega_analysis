@@ -68,6 +68,10 @@ function runLive(points, timeframe) {
   const client = { readyState: 1, messages: [], send(raw) { this.messages.push(JSON.parse(raw)); } };
   stream.__test.sessions.set(client, {
     symbol: 'NIFTY', expiry: '2026-08-28', timeframe, lastBucket: null,
+    // A live session is a subscription to ONE trading day, and the push path
+    // now refuses a point belonging to any other. These synthetic samples all
+    // sit on T0's IST day, so that is the day this session is watching.
+    tradingDate: vega.tradingDateOf({ time: T0 }),
   });
   try {
     for (const p of points) {
@@ -105,6 +109,7 @@ test('the in-progress bucket updates as samples arrive (no frozen bar)', () => {
   const client = { readyState: 1, messages: [], send(raw) { this.messages.push(JSON.parse(raw)); } };
   stream.__test.sessions.set(client, {
     symbol: 'NIFTY', expiry: '2026-08-28', timeframe: '1m', lastBucket: null,
+    tradingDate: vega.tradingDateOf({ time: T0 }),
   });
   try {
     for (const p of points) {

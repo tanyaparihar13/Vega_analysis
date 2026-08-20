@@ -201,10 +201,25 @@ async function handleSubscribe(client, { symbol, expiry, timeframe }) {
     }
 
     const previous = sessions.get(client);
+    /**
+     * THE TRADING DATE IS PART OF THE IDENTITY OF A LIVE SESSION.
+     *
+     * A socket subscription is by definition a subscription to TODAY — a
+     * historical date has nothing to stream and the client disables the hook
+     * for one. That made the date look like a constant, so nothing carried it.
+     * It is not constant: a terminal left open overnight rolls into a new
+     * session while its subscription still describes the old one, and the
+     * sampler then pushes the NEW day's 09:15 into a chart still showing the
+     * OLD day. That is the same two-day mixing the buffer used to do, arriving
+     * live instead of on load — and the buffer fix cannot reach it, because by
+     * then the point is a legitimate point of the current session being sent
+     * to a client that is not watching the current session.
+     */
     sessions.set(client, {
       symbol: cfgU.key,
       expiry: chosen,
       timeframe: tf,
+      tradingDate: vegaTimeseriesService.todayIst(),
       // Reset the emit gate whenever the SERIES changes, so the first point of
       // a newly selected instrument goes out immediately instead of waiting for
       // the next bucket boundary.
@@ -261,6 +276,9 @@ async function handleSubscribe(client, { symbol, expiry, timeframe }) {
       expiry: chosen,
       expiries,
       timeframe: tf,
+      // The IST session these points belong to, stated rather than assumed, so
+      // the client can refuse a back-fill for a day it is no longer viewing.
+      tradingDate: vegaTimeseriesService.todayIst(),
       resolution: vegaTimeseriesService.persistResolutionFor(cfgU.key),
       isIndex: vegaTimeseriesService.isIndex(cfgU.key),
       // 'memory' | 'database' | 'empty' — so the client can tell a warm start
@@ -345,6 +363,18 @@ function handleSamplerTick(updated) {
      * COST: one message per client per 5s (~200 bytes) instead of one per
      * bucket. On a 15m chart that is 180x more messages and ~40 B/s.
      */
+    /**
+     * A POINT MAY ONLY REACH A SESSION OPENED ON ITS OWN TRADING DAY.
+     *
+     * The sampler only ever produces today's points, so this fires in exactly
+     * one situation: a socket open across midnight. Skipping leaves the stale
+     * chart alone until the client resubscribes for the new day, which is the
+     * conservative choice — showing yesterday's completed session is honest,
+     * quietly growing it with today's points is not.
+     */
+    const pointDate = vegaTimeseriesService.tradingDateOf(point);
+    if (session.tradingDate && pointDate && pointDate !== session.tradingDate) continue;
+
     const bucket = vegaTimeseriesService.bucketStartFor(point.time, session.timeframe);
     const bucketAdvanced = session.lastBucket !== bucket;
     session.lastBucket = bucket;
@@ -354,6 +384,7 @@ function handleSamplerTick(updated) {
       symbol: session.symbol,
       expiry: session.expiry,
       timeframe: session.timeframe,
+      tradingDate: pointDate,
       // True on the first sample of a new bucket. The client uses it only to
       // distinguish "append a bar" from "revise the open bar"; correctness does
       // not depend on it, because the timestamps already say which is which.
@@ -383,7 +414,8 @@ function decorateForWire(point) {
 function getStats() {
   return {
     clients: sessions.size,
-    sessions: [...sessions.values()].map(({ symbol, expiry, timeframe }) => ({ symbol, expiry, timeframe })),
+    sessions: [...sessions.values()].map(({ symbol, expiry, timeframe, tradingDate }) =>
+      ({ symbol, expiry, timeframe, tradingDate })),
   };
 }
 

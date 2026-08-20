@@ -28,9 +28,11 @@ import marketSocket from '../../services/marketSocket';
  * @param {string}   args.symbol
  * @param {string}   args.expiry
  * @param {string}   args.timeframe
+ * @param {string}   args.tradingDate  the IST session on screen; a payload that
+ *                                     names a different one is not ours
  * @param {boolean}  args.enabled   false for a historical date; no socket traffic at all
  */
-export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
+export default function useVegaStream({ symbol, expiry, timeframe, tradingDate, enabled }) {
   const [points, setPoints] = useState([]);
   const [meta, setMeta] = useState(null);
   const [error, setError] = useState(null);
@@ -55,8 +57,33 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
 
   // What we are currently subscribed to, readable from inside the message
   // handler without making the handler depend on it.
-  const wantRef = useRef({ symbol: null, expiry: null, timeframe: null });
-  wantRef.current = enabled ? { symbol, expiry, timeframe } : { symbol: null, expiry: null, timeframe: null };
+  const wantRef = useRef({ symbol: null, expiry: null, timeframe: null, tradingDate: null });
+  wantRef.current = enabled
+    ? { symbol, expiry, timeframe, tradingDate }
+    : { symbol: null, expiry: null, timeframe: null, tradingDate: null };
+
+  /**
+   * THE TRADING DATE IS PART OF THE IDENTITY OF THIS SERIES.
+   *
+   * Symbol, expiry and timeframe were already matched; the date was not,
+   * because a live subscription is implicitly "today" and today does not change
+   * while a tab is open — except that it does. A terminal left open overnight
+   * rolls into a new session, and the server would push the NEW day's 09:15
+   * into a chart still labelled with the OLD day. The server now refuses that
+   * too; both sides check, because neither should be the only thing standing
+   * between two trading days.
+   *
+   * A payload carrying no `tradingDate` is from a server older than this
+   * change and is accepted, so a rolling deploy does not blank every open
+   * chart mid-session.
+   */
+  const dateMatches = (msg, want) =>
+    msg.tradingDate == null || msg.tradingDate === want.tradingDate;
+
+  // The day the mounted series belongs to, so the subscription effect can tell
+  // a DATE change (invalidate immediately) from an instrument change (keep the
+  // outgoing curve on screen and transition).
+  const lastDateRef = useRef(tradingDate);
 
   // ---- the single message listener ---------------------------------------
   useEffect(() => {
@@ -110,7 +137,8 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
          */
         if (msg.symbol !== want.symbol
           || msg.expiry !== want.expiry
-          || msg.timeframe !== want.timeframe) return;
+          || msg.timeframe !== want.timeframe
+          || !dateMatches(msg, want)) return;
         setError(null);
         setNotice(null);
         setSwitching(false);
@@ -130,7 +158,8 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
       }
 
       if (msg.type === 'vega_point') {
-        if (msg.symbol !== want.symbol || msg.expiry !== want.expiry || msg.timeframe !== want.timeframe) return;
+        if (msg.symbol !== want.symbol || msg.expiry !== want.expiry
+          || msg.timeframe !== want.timeframe || !dateMatches(msg, want)) return;
         const incoming = msg.point;
         if (!incoming) return;
 
@@ -198,12 +227,29 @@ export default function useVegaStream({ symbol, expiry, timeframe, enabled }) {
      */
     setSwitching(true);
 
+    /**
+     * A DATE CHANGE INVALIDATES THE DATASET IMMEDIATELY — and ONLY a date change.
+     *
+     * Everything above deliberately keeps the outgoing series mounted until its
+     * replacement lands, because an instrument switch reads better as a
+     * transition than as a blank frame. A trading-date change is different in
+     * kind: those points are not a stale view of the same thing, they are a
+     * different day, and leaving them up for even one frame is the mixing this
+     * is meant to prevent. Gated on the date alone so instrument switches keep
+     * their smooth transition.
+     */
+    if (lastDateRef.current !== tradingDate) {
+      lastDateRef.current = tradingDate;
+      setPoints([]);
+      setMeta(null);
+    }
+
     marketSocket.send({ type: 'subscribe_vega', symbol, expiry: expiry || undefined, timeframe });
 
     return () => {
       marketSocket.send({ type: 'unsubscribe_vega' });
     };
-  }, [symbol, expiry, timeframe, enabled]);
+  }, [symbol, expiry, timeframe, tradingDate, enabled]);
 
   return { points, meta, error, notice, switching };
 }
