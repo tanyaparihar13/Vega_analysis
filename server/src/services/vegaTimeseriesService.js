@@ -146,6 +146,15 @@ function expiryKey(value) {
 }
 
 /** The composite key every in-memory lookup uses. */
+/**
+ * The IST trading date a point belongs to. Points carry UNIX seconds; the
+ * session is an IST day, so the two only agree if the shift is explicit.
+ */
+function tradingDateOf(point) {
+  if (!point || point.time == null) return null;
+  return istParts(new Date(Number(point.time) * 1000)).date;
+}
+
 function stateKey(symbol, expiry) {
   return `${String(symbol).toUpperCase()}|${expiryKey(expiry)}`;
 }
@@ -502,8 +511,32 @@ async function captureDayOpen(symbol, expiry) {
   if (!chosen) return null;
 
   const key = stateKey(c.key, chosen);
-  const entry = state.get(key) || { symbol: c.key, expiry: chosen, open: null, series: [] };
-  if (entry.open) return entry.open; // immutable for the session
+  const entry = state.get(key) || { symbol: c.key, expiry: chosen, date: istParts().date, open: null, series: [] };
+
+  /**
+   * A STALE SESSION IS NOT THIS SESSION.
+   *
+   * `if (entry.open) return entry.open` is right WITHIN a session — the
+   * baseline is immutable once taken. Across sessions it was a trapdoor: a
+   * process left running past midnight still held yesterday's entry, so this
+   * returned yesterday's baseline and today's capture never ran at all. Today
+   * then measured `current - open` against the PREVIOUS day's chain, the first
+   * sample of the session was not zero, and openPutVega drifted sample to
+   * sample as dynamic selection pulled different strikes out of a chain that
+   * belonged to another day.
+   *
+   * This has to be checked BEFORE the immutability shortcut, or the shortcut
+   * hides it — which is exactly what happened on 2026-08-20.
+   */
+  const todayIstDate = istParts().date;
+  if (entry.date && entry.date !== todayIstDate) {
+    entry.date = todayIstDate;
+    entry.open = null;
+    entry.series = [];
+    state.set(key, entry);
+  }
+
+  if (entry.open) return entry.open; // immutable WITHIN the session
 
   /**
    * NOT BEFORE 09:16 IST (addvega.php parity).
@@ -603,6 +636,28 @@ function computeDiffs(symbol, expiry, at = new Date()) {
 
 /** Push into the bounded live buffer, replacing a same-second duplicate. */
 function appendLive(key, entry, point) {
+  /**
+   * DAY ROLLOVER (trading-date isolation).
+   *
+   * `state` is keyed by SYMBOL|EXPIRY, deliberately — the expiry outlives the
+   * day. But the buffer inside it does not: it belongs to ONE session. The only
+   * thing that used to clear it was loadToday(), which runs once at boot, so a
+   * process left running across midnight kept yesterday's tail and appended
+   * today's points to it. The terminal then showed 15:30 rows from the previous
+   * session sitting above 09:15 rows from this one.
+   *
+   * A point whose IST trading date differs from the buffer's starts the buffer
+   * again. The rows are still on disk; only the in-memory view resets.
+   */
+  const pointDate = tradingDateOf(point);
+  if (pointDate && entry.date && entry.date !== pointDate) {
+    entry.series = [];
+    entry.open = null;
+    entry.date = pointDate;
+  } else if (pointDate && !entry.date) {
+    entry.date = pointDate;
+  }
+
   const last = entry.series[entry.series.length - 1];
   if (last && last.time === point.time) entry.series[entry.series.length - 1] = point;
   else entry.series.push(point);
@@ -824,6 +879,7 @@ async function loadToday() {
       state.set(stateKey(o.symbol, expiry), {
         symbol: String(o.symbol).toUpperCase(),
         expiry,
+        date: today,
         open: {
           date: today, symbol: o.symbol, expiry, capturedAt: o.captured_at,
           chain: parseJson(o.open_chain),
@@ -839,7 +895,7 @@ async function loadToday() {
       if (!expiry) continue;
       const key = stateKey(r.symbol, expiry);
       const entry = state.get(key)
-        || { symbol: String(r.symbol).toUpperCase(), expiry, open: null, series: [] };
+        || { symbol: String(r.symbol).toUpperCase(), expiry, date: today, open: null, series: [] };
       entry.series.push(rowToPoint(r));
       state.set(key, entry);
     }
@@ -1212,6 +1268,27 @@ async function loadByDate(symbol, date, timeframe = '1m', expiry = null) {
     }
   }
 
+  /**
+   * ONE REQUESTED DATE = ONE DATASET.
+   *
+   * Whatever the source — live buffer or SQL — nothing may leave this function
+   * that belongs to another trading session. This is a boundary, not a filter:
+   * if a point from another date ever reaches here again, it is dropped and
+   * counted rather than rendered.
+   */
+  const foreign = points.filter((p) => {
+    const d = tradingDateOf(p);
+    return d && d !== date;
+  }).length;
+  if (foreign) {
+    points = points.filter((p) => {
+      const d = tradingDateOf(p);
+      return !d || d === date;
+    });
+    console.warn(`[VegaSeries] Dropped ${foreign} point(s) from another trading date `
+      + `for ${key} ${date} ${chosen || ''} — investigate the source.`);
+  }
+
   const meta = await loadDayOpenMeta(key, date, chosen);
   const summary = dayOpenSummaryFromPoints(points);
 
@@ -1223,6 +1300,9 @@ async function loadByDate(symbol, date, timeframe = '1m', expiry = null) {
     points,
     dayOpen,
     live,
+    // The session this dataset belongs to, stated rather than inferred from
+    // the points (which may legitimately be empty) or from the expiry.
+    tradingDate: date,
     expiry: chosen,
     timeframe,
     // Served from the live buffer -> the base clock, whatever this instrument
@@ -1423,6 +1503,10 @@ function getSeries(symbol, timeframe = '1m', expiry = null) {
   const chosen = expiryKey(expiry) || defaultLiveExpiry(key);
   if (!chosen) return [];
   const entry = state.get(stateKey(key, chosen));
+  // A buffer left over from a previous session is not today's data. Serving it
+  // is what mixed 15:30 rows into a 09:15 chart; an empty answer sends the
+  // caller to the historical read path, which is date-filtered in SQL.
+  if (entry?.date && entry.date !== istParts().date) return [];
   return bucketByTimeframe(entry?.series || [], timeframe).map(decorate);
 }
 
@@ -1555,11 +1639,14 @@ module.exports = {
   listExpiries, resolveExpiry, trackedExpiries, defaultLiveExpiry,
   registerDemand, releaseDemand, onTick,
   resolveSymbol, isIndex, persistResolutionFor, canServe, servableTimeframes,
-  storedResolutions, bucketByTimeframe, bucketStartFor, isUsableOpenChain,
+  storedResolutions, bucketByTimeframe, bucketStartFor, isUsableOpenChain, tradingDateOf,
   loadDelayed, PUBLIC_DELAY_MINUTES,
   // Exported so the WebSocket push uses the SAME sign convention and trend
   // derivation as every other reader — see decorate()'s header.
   decorate,
   purgeOldHistory,
   TIMEFRAMES: cfg.TIMEFRAMES, startFor, strikeWindowFor, expiryCountFor, todayIst,
+  // Same pattern as vegaStreamService: the day-rollover reset lives in the
+  // in-memory buffer, so a test needs to reach it directly.
+  __test: { state, stateKey, appendLive },
 };
