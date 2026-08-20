@@ -8,7 +8,11 @@ const chainSnapshotStore = require('./chainSnapshotStore');
 const subscriptionManager = require('./subscriptionManager');
 const constants = require('../constants/instruments');
 const cfg = require('../config/vegaConfig');
-const { computePoint, pickStrikes } = require('../utils/vegaMath');
+// `round` is vegaMath's own 4dp rounding. Imported rather than re-implemented
+// so a re-anchored value is rounded EXACTLY as computePoint rounds the value
+// it was derived from — a second rounding rule would make the two disagree in
+// the last decimal and put the table and the chart out of step.
+const { computePoint, pickStrikes, round } = require('../utils/vegaMath');
 const { classifyTrend } = require('../utils/vegaTrend');
 
 const { UNDERLYINGS } = constants;
@@ -550,6 +554,109 @@ function baselineLateness(capturedAt) {
     capturedAtIst: fmtMin(minutes),
     minutesAfterOpen: minutes - cfg.MARKET_OPEN_MIN,
     late: minutes > cfg.BASELINE_MAX_IST,
+  };
+}
+
+/**
+ * ===========================================================================
+ * INTRADAY RE-ANCHORING — one session, read path only, nothing stored.
+ * ===========================================================================
+ * Every value is `current − open`, so re-origining a series to a later moment
+ * is subtraction, not a second capture:
+ *
+ *     newDiff(t) = oldDiff(t) − oldDiff(anchor)
+ *              = [cur(t) − open] − [cur(anchor) − open]
+ *              = cur(t) − cur(anchor)
+ *
+ * The old origin appears in both terms and cancels. That is the whole reason
+ * this needs no option chain, no capture timing, and no write: it is exact
+ * regardless of what the old baseline was, including a wrong one, and it can
+ * be applied to a moment that has already passed.
+ *
+ * WHAT IT IS NOT. It does not create a baseline. `vega_day_open` is never read
+ * differently, never written, never overwritten; the stored `vega_timeseries`
+ * rows keep the exact meaning they were recorded with. Unset the config and
+ * the normal view returns with no migration and nothing to undo.
+ *
+ * THE ONE APPROXIMATION, STATED HONESTLY. This is exact when the strike basket
+ * is the same at `t` and at the anchor. STRIKE_MODE is 'stable' — the basket is
+ * fixed at day-open and only leaves via the hysteresis exit — so drift is rare,
+ * and when a strike does leave, it leaves both `cur` and `open`, so the terms
+ * partially self-cancel rather than cancelling exactly. A freshly CAPTURED
+ * 14:00 chain would differ from this by that second-order amount only.
+ *
+ * `openCallVega`/`openPutVega` are rewritten to the anchor's ABSOLUTE totals so
+ * the day-open panel reports what this series is actually measured from rather
+ * than a morning figure the points no longer relate to.
+ */
+
+/** The active intraday anchor for one trading date, or null. Date-scoped, so
+ *  it can only ever affect the single session it names. */
+function intradayAnchorFor(date) {
+  const b = cfg.INTRADAY_BASELINE;
+  return b && b.date === date ? b : null;
+}
+
+/** UNIX seconds of `minutes`-from-IST-midnight on an IST calendar date. */
+function istMomentOf(date, minutes) {
+  const hh = String(Math.floor(minutes / 60)).padStart(2, '0');
+  const mm = String(minutes % 60).padStart(2, '0');
+  return Math.floor(Date.parse(`${date}T${hh}:${mm}:00+05:30`) / 1000);
+}
+
+/**
+ * Re-anchor RAW points to the first sample at or after the configured moment.
+ *
+ * Applied to raw points BEFORE bucketing, which is what makes the anchor
+ * identical on every timeframe: 14:00 IST is a whole multiple of 60/180/300/900
+ * seconds from the epoch, so the same sample opens the first bucket at 1m, 3m,
+ * 5m and 15m alike. Re-anchoring after bucketing would let the anchor drift
+ * with the timeframe.
+ *
+ * Points BEFORE the anchor are dropped, not zeroed: they were measured from a
+ * different origin, and joining them to this series is the discontinuity this
+ * exists to avoid.
+ *
+ * @returns {{points: Array, anchor: {time:number, label:string, callVega:number|null,
+ *           putVega:number|null}|null, active: boolean}}
+ */
+function reanchorPoints(points, date) {
+  const a = intradayAnchorFor(date);
+  if (!a) return { points, anchor: null, active: false };
+
+  const cutoff = istMomentOf(date, a.minutes);
+  const idx = points.findIndex((p) => p.time >= cutoff);
+  // The anchor has not been reached yet in this session's data. Serving the
+  // pre-anchor points would be exactly the mixed series the caller asked to
+  // avoid, so the honest answer is an empty one.
+  if (idx < 0) return { points: [], anchor: null, active: true };
+
+  const base = points[idx];
+  const out = points.slice(idx).map((p) => {
+    const call = round(p.callVegaDiff - base.callVegaDiff);
+    const put = round(p.putVegaDiff - base.putVegaDiff);
+    return {
+      ...p,
+      callVegaDiff: call,
+      putVegaDiff: put,
+      // Recomputed from the re-anchored pair rather than shifted, so the
+      // Difference = Put − Call invariant is visibly preserved rather than
+      // relied upon. Linearity makes the two identical.
+      vegaDiff: round(put - call),
+      openCallVega: base.currentCallVega ?? null,
+      openPutVega: base.currentPutVega ?? null,
+    };
+  });
+
+  return {
+    points: out,
+    anchor: {
+      time: base.time,
+      label: a.label,
+      callVega: base.currentCallVega ?? null,
+      putVega: base.currentPutVega ?? null,
+    },
+    active: true,
   };
 }
 
@@ -1239,7 +1346,12 @@ async function readStoredPoints(symbol, date, timeframe = '1m', expiry = null, r
       resolution: resolution || null,
     }
   );
-  return bucketByTimeframe(rows.map(rowToPoint), timeframe).map(decorate);
+  // Re-anchor BEFORE bucketing, so the origin is the same SAMPLE on every
+  // timeframe rather than the first bucket each timeframe happens to open.
+  // No-op unless this exact trading date is the configured one.
+  const { points } = reanchorPoints(rows.map(rowToPoint), date);
+
+  return bucketByTimeframe(points, timeframe).map(decorate);
 }
 
 /**
@@ -1419,6 +1531,17 @@ async function loadByDate(symbol, date, timeframe = '1m', expiry = null) {
       + `for ${key} ${date} ${chosen || ''} — investigate the source.`);
   }
 
+  /**
+   * NAME the origin for the payload. `points` has already been re-anchored by
+   * getSeries/readStoredPoints, so this cannot change any number — deriving the
+   * anchor from the anchored points would just report 0. It exists so the UI
+   * can say WHICH origin these values are measured from, which is the one thing
+   * that must never be ambiguous: a re-anchored session is numerically
+   * indistinguishable from a normal one.
+   */
+  const intraday = intradayAnchorFor(date);
+  const anchorPoint = intraday && points.length ? points[0] : null;
+
   const meta = await loadDayOpenMeta(key, date, chosen);
   const summary = dayOpenSummaryFromPoints(points);
 
@@ -1444,6 +1567,22 @@ async function loadByDate(symbol, date, timeframe = '1m', expiry = null) {
     unavailable,
     hasBaseline: !!(meta || summary || (live && chosen && state.get(stateKey(key, chosen))?.open)),
     fromStore,
+    /**
+     * Present ONLY while this session is served re-anchored. Its presence is
+     * what tells the client to label the chart an intraday verification
+     * baseline rather than letting the reader assume the market open.
+     */
+    intradayBaseline: intraday
+      ? {
+        type: 'intraday_verification',
+        tradingDate: date,
+        label: intraday.label,
+        anchorTime: anchorPoint ? anchorPoint.time : null,
+        callVega: anchorPoint?.openCallVega ?? null,
+        putVega: anchorPoint?.openPutVega ?? null,
+        reached: !!anchorPoint,
+      }
+      : null,
   };
 }
 
@@ -1530,7 +1669,12 @@ async function loadDelayed(symbol, { delayMinutes = PUBLIC_DELAY_MINUTES, timefr
     );
 
     if (rows.length) {
-      const points = bucketByTimeframe(rows.map(rowToPoint), timeframe).map(decorate);
+      // The public teaser is re-anchored too. A session whose origin is known
+      // to be wrong should not be shown mis-anchored to anyone, and letting the
+      // public and premium views disagree about the same minute would be worse
+      // than either alone.
+      const { points: reAnchored } = reanchorPoints(rows.map(rowToPoint), today);
+      const points = bucketByTimeframe(reAnchored, timeframe).map(decorate);
       return {
         date: today, expiry: frontExpiry, points, delayMinutes: minutes,
         isFallbackDay: false,
@@ -1636,8 +1780,36 @@ function getSeries(symbol, timeframe = '1m', expiry = null) {
   // A buffer left over from a previous session is not today's data. Serving it
   // is what mixed 15:30 rows into a 09:15 chart; an empty answer sends the
   // caller to the historical read path, which is date-filtered in SQL.
-  if (entry?.date && entry.date !== istParts().date) return [];
-  return bucketByTimeframe(entry?.series || [], timeframe).map(decorate);
+  const today = istParts().date;
+  if (entry?.date && entry.date !== today) return [];
+
+  const { points } = reanchorPoints(entry?.series || [], today);
+  return bucketByTimeframe(points, timeframe).map(decorate);
+}
+
+/**
+ * The RAW anchor sample for a live series, or null.
+ *
+ * The WebSocket pushes one point at a time and therefore cannot re-anchor by
+ * looking at an array — it needs the anchor's own values to subtract. Reading
+ * them from the same live buffer getSeries() re-anchors guarantees the
+ * incremental push and the back-fill agree; deriving them separately is how a
+ * streaming chart drifts away from the one a reload produces.
+ */
+function liveAnchorBase(symbol, expiry) {
+  const key = String(symbol || '').toUpperCase();
+  const chosen = expiryKey(expiry) || defaultLiveExpiry(key);
+  if (!chosen) return null;
+
+  const today = istParts().date;
+  const a = intradayAnchorFor(today);
+  if (!a) return null;
+
+  const entry = state.get(stateKey(key, chosen));
+  if (!entry || entry.date !== today) return null;
+
+  const cutoff = istMomentOf(today, a.minutes);
+  return entry.series.find((p) => p.time >= cutoff) || null;
 }
 
 /** Normalized day-open summary for TODAY's live series (used by routes). */
@@ -1771,6 +1943,7 @@ module.exports = {
   resolveSymbol, isIndex, persistResolutionFor, canServe, servableTimeframes,
   storedResolutions, bucketByTimeframe, bucketStartFor, isUsableOpenChain, tradingDateOf,
   needsDayOpenCapture, baselineLateness,
+  reanchorPoints, intradayAnchorFor, istMomentOf, liveAnchorBase,
   loadDelayed, PUBLIC_DELAY_MINUTES,
   // Exported so the WebSocket push uses the SAME sign convention and trend
   // derivation as every other reader — see decorate()'s header.

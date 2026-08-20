@@ -907,8 +907,27 @@ export default function VegaAnalysis() {
    * derived server-side from the stored `captured_at` against BASELINE_MAX_IST,
    * so a normal 09:16 capture says nothing at all here.
    */
+  /**
+   * A re-anchored session must SAY so. Its numbers look exactly like a normal
+   * session's, so without this the reader would compare a 14:00-origin chart
+   * against a full-session reference and conclude the data is wrong — which is
+   * the confusion this whole exercise exists to remove. It takes precedence
+   * over the late-baseline notice because when a session is re-anchored, the
+   * day-open baseline is not what the values are measured from at all.
+   */
+  const intraday = data?.intradayBaseline;
+  const intradayNotice = intraday
+    ? (intraday.reached
+      ? `Intraday verification baseline — ${intraday.label} IST. These values are`
+        + ` measured from ${intraday.label}, not from the market open, and the chart`
+        + ` starts there. Today's earlier data is excluded, not hidden: it was`
+        + ` recorded against a different origin.`
+      : `Intraday verification baseline — ${intraday.label} IST. No samples at or`
+        + ` after ${intraday.label} yet, so there is nothing to show for this session.`)
+    : null;
+
   const baseline = data?.dayOpen;
-  const baselineNotice = baseline?.late && points.length
+  const baselineNotice = !intraday && baseline?.late && points.length
     ? `Day-open baseline for ${symbol} was captured at ${baseline.capturedAtIst} IST`
       + `${baseline.minutesAfterOpen != null ? `, ${baseline.minutesAfterOpen} minutes after the 09:15 open` : ''}`
       + `. These values are measured from that point, not from the open — the shape of the`
@@ -1104,6 +1123,15 @@ export default function VegaAnalysis() {
         the difference between a chart that is honest about its origin and one
         that quietly implies 09:15.
       */}
+      {!error && intradayNotice && (
+        <div
+          role="status"
+          className="rounded-xl border border-sky-300/60 bg-sky-50 p-3 text-sm font-medium text-sky-900"
+        >
+          {intradayNotice}
+        </div>
+      )}
+
       {!error && baselineNotice && (
         <div
           role="status"

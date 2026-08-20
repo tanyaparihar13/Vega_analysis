@@ -375,6 +375,35 @@ function handleSamplerTick(updated) {
     const pointDate = vegaTimeseriesService.tradingDateOf(point);
     if (session.tradingDate && pointDate && pointDate !== session.tradingDate) continue;
 
+    /**
+     * INTRADAY RE-ANCHORING, APPLIED TO THE INCREMENTAL PUSH TOO.
+     *
+     * getSeries() re-anchors the back-fill, so without this the first message
+     * after a re-anchored back-fill would arrive on the OLD origin and the
+     * chart would jump by exactly the anchor's value — the streaming chart and
+     * the reloaded one disagreeing, which is the failure the whole
+     * one-definition rule exists to prevent. Subtracting the same anchor sample
+     * getSeries() used keeps them identical by construction.
+     *
+     * A point BEFORE the anchor is dropped rather than sent: it belongs to the
+     * discarded pre-anchor segment.
+     */
+    let outgoing = point;
+    const anchorBase = vegaTimeseriesService.liveAnchorBase(session.symbol, session.expiry);
+    if (anchorBase) {
+      if (point.time < anchorBase.time) continue;
+      const call = point.callVegaDiff - anchorBase.callVegaDiff;
+      const put = point.putVegaDiff - anchorBase.putVegaDiff;
+      outgoing = {
+        ...point,
+        callVegaDiff: call,
+        putVegaDiff: put,
+        vegaDiff: put - call,          // Difference = Put - Call, preserved
+        openCallVega: anchorBase.currentCallVega ?? null,
+        openPutVega: anchorBase.currentPutVega ?? null,
+      };
+    }
+
     const bucket = vegaTimeseriesService.bucketStartFor(point.time, session.timeframe);
     const bucketAdvanced = session.lastBucket !== bucket;
     session.lastBucket = bucket;
@@ -391,7 +420,7 @@ function handleSamplerTick(updated) {
       bucketAdvanced,
       // Stamped with the BUCKET's start time, matching the historical
       // aggregator, so live and reloaded charts land on identical x values.
-      point: { ...decorateForWire(point), time: bucket },
+      point: { ...decorateForWire(outgoing), time: bucket },
     });
   }
 }

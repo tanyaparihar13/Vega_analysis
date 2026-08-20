@@ -85,7 +85,8 @@ router.get('/:symbol/series', authenticate, requirePremium, async (req, res) => 
     const { expiry, available } =
       await vegaTimeseriesService.resolveExpiry(cfgU.key, resolvedDate, expiryParam.value);
 
-    const { points, dayOpen, live, hasBaseline, fromStore, resolution, storedResolutions, unavailable } =
+    const { points, dayOpen, live, hasBaseline, fromStore, resolution, storedResolutions,
+      unavailable, intradayBaseline } =
       await vegaTimeseriesService.loadByDate(cfgU.key, resolvedDate, timeframe, expiry);
 
     const latest = points.length ? points[points.length - 1] : null;
@@ -116,6 +117,13 @@ router.get('/:symbol/series', authenticate, requirePremium, async (req, res) => 
        * be empty) or — the mistake this guards against — from the expiry.
        */
       tradingDate: resolvedDate,
+      /**
+       * Non-null ONLY for a session being served from a temporary intraday
+       * origin. The numbers are indistinguishable from a normal session, so the
+       * label is the only thing standing between the reader and the assumption
+       * that this is measured from the market open.
+       */
+      intradayBaseline: intradayBaseline || null,
       live,
       source: live && !fromStore ? 'memory' : 'database',
       strikeMode: cfg.STRIKE_MODE,                       // 'stable' | 'frozen' | 'dynamic'

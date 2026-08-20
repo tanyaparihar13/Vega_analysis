@@ -293,6 +293,59 @@ module.exports = {
   BASELINE_MAX_IST: envNum('VEGA_BASELINE_MAX_IST', 565),
 
   /**
+   * INTRADAY VERIFICATION BASELINE — a temporary, date-scoped re-origin.
+   *
+   *     VEGA_INTRADAY_BASELINE=2026-08-20:14:00
+   *
+   * PURPOSE. When a session's day-open baseline is known to be wrong (the
+   * recorder was down at 09:16, so the day got anchored wherever it restarted),
+   * the curve's SHAPE is still correct and only its origin is displaced. This
+   * lets that session be re-read from a clean intraday origin so the data can be
+   * checked against a reference chart, without waiting for the next morning.
+   *
+   * IT IS NOT A SECOND BASELINE. Nothing is captured, nothing is written, and
+   * `vega_day_open` is never touched. Re-anchoring a difference series is
+   * arithmetic on rows that already exist:
+   *
+   *     newDiff(t) = oldDiff(t) − oldDiff(anchor)
+   *
+   * The old origin appears in both terms and cancels, which is exactly why this
+   * needs no chain capture and cannot be affected by whatever the old baseline
+   * was. It is applied on the READ path only, so the stored rows keep their
+   * original meaning and removing this variable restores the normal view
+   * instantly.
+   *
+   * IT EXPIRES BY CONSTRUCTION. The date is part of the value and is compared
+   * against the trading date being read, so it can only ever affect the ONE
+   * session it names. There is no form of this setting that silently becomes
+   * tomorrow's baseline: tomorrow's date does not match, and the normal
+   * market-open path runs untouched. Leaving the variable set is therefore
+   * harmless — though it should still be removed once the check is done.
+   *
+   * @type {{date: string, minutes: number, label: string}|null}
+   */
+  INTRADAY_BASELINE: (() => {
+    const raw = String(process.env.VEGA_INTRADAY_BASELINE || '').trim();
+    if (!raw) return null;
+    const m = /^(\d{4}-\d{2}-\d{2}):(\d{2}):(\d{2})$/.exec(raw);
+    if (!m) {
+      console.warn(`[VegaConfig] Ignoring VEGA_INTRADAY_BASELINE='${raw}' — `
+        + `expected YYYY-MM-DD:HH:MM (e.g. 2026-08-20:14:00)`);
+      return null;
+    }
+    const [, date, hh, mm] = m;
+    const minutes = Number(hh) * 60 + Number(mm);
+    if (!(minutes >= 0 && minutes < 1440)) {
+      console.warn(`[VegaConfig] Ignoring VEGA_INTRADAY_BASELINE='${raw}' — not a real time of day`);
+      return null;
+    }
+    console.warn(`[VegaConfig] INTRADAY BASELINE ACTIVE for ${date} at ${hh}:${mm} IST. `
+      + `That ONE session is served re-anchored to ${hh}:${mm}; every other date, `
+      + `including tomorrow, uses the normal market-open baseline. Stored rows are unchanged.`);
+    return { date, minutes, label: `${hh}:${mm}` };
+  })(),
+
+  /**
    * Minimum fraction of the board that must be priced ON EACH SIDE before the
    * day-open baseline is accepted.
    *
